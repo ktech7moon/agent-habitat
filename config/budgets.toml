@@ -39,4 +39,12 @@ approaching_threshold = 0.80
 daily_cap_usd = 2.00
 
 [workflow_types.lead_enrichment]
+# Slice 8 calibration (2026-05-15) measured full-run cost $0.066–$0.171,
+# mean $0.126, across four real companies with the unmodified ADR-004
+# placeholder rubric. $10/day therefore affords ~58–150 full runs/day —
+# comfortable headroom for a small freelance prospecting flow without
+# being so loose that a runaway loop would go unnoticed. Cap stays at
+# $10.00; revisit when (a) a real ICP rubric replaces the placeholder
+# and the retry-fire rate stabilises, or (b) a workload growth signal
+# pushes daily volume above ~30 runs and the headroom narrows.
 daily_cap_usd = 10.00

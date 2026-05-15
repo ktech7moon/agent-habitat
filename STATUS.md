@@ -4,6 +4,201 @@
 Phase 2 — 5-Agent Lead Enrichment Crew (full plan: docs/ROADMAP.md)
 
 ## Current Slice
+**Phase 2 Slice 8 (calibration — four real companies + rejection path) — DONE
+2026-05-15.** Pure measurement session. No code changes. Ran the
+complete five-agent crew end-to-end via `agent-habitat run-crew`
+against four companies in order (Anthropic, Stripe, Plaid, Modal
+Labs) plus one deliberate-rejection run on Plaid, under the
+unmodified ADR-004 placeholder rubric. Full deterministic suite (515
+tests) clean post-runs; ruff check + ruff format + mypy strict all
+clean. ADR-006 §1 cost prose updated with real range/mean/retry-rate
+numbers; `config/budgets.toml` `lead_enrichment` cap stays at $10/day
+with calibrated rationale recorded in-file. **Phase 2 is complete.**
+
+## Phase 2 Slice 8 — Calibration Results
+
+Four real-company runs ordered highest → lowest signal, plus one
+rejection-path validation. Total session spend: **$0.546766**, well
+inside the $10/day cap and inside the kickoff's $0.45–$0.75
+projection.
+
+### Headline table
+
+| # | Company | Workflow id (prefix) | Coverage | Score | Tier | Outcome | Critic fired | Retry outcome | Total cost | Wall-time |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | Anthropic | `49aba97a` | 60% | 53.33 | n/a | COMPLETED — `terminate_no_draft` (`score_gated`, floor 55.0) | n/a (no drafter) | n/a | **$0.066029** | ~22s |
+| 2 | Stripe | `8769eb77` | 50% | 68.00 | B | COMPLETED — Draft produced | NO (first-contact substring-clean) | n/a | **$0.098515** | ~30s |
+| 3 | Plaid (happy) | `ca48ddb8` | 50% | 100.00 | A | **FAILED — `critic_failure` (persistent fabrication)** | YES (3 Mode-2 calls initial; 1 on retry) | **retry FAILED** → halt at retries=2 | **$0.167251** | ~40s |
+| 4 | Modal Labs | `e8f99588` | 50% | 76.00 | B | COMPLETED — Draft produced (after retry) | YES (3 Mode-2 calls initial; 0 on retry) | **retry SUCCEEDED** | **$0.171341** | ~30s |
+| R | Plaid (rejection test) | `bfcb89c9` | 50% | 100.00 | A | **CANCELLED — `terminate_reason='rejected'`** | n/a (drafter not invoked) | n/a | **$0.043630** | ~12s |
+
+Three of the three structurally-distinct critic outcomes were
+observed live: no-firing (Stripe), retry-succeeds (Modal Labs),
+retry-fails-and-halts (Plaid). This is the validation envelope
+ADR-006 §1's retry policy was designed against.
+
+### Per-run cost breakdowns (real Anthropic billing)
+
+| Agent | Anthropic | Stripe | Plaid (happy) | Modal Labs | Plaid (rejection) |
+|---|---|---|---|---|---|
+| researcher (Haiku + web_search) | $0.046094 | $0.024928 | $0.023668 | $0.026368 | $0.023668* |
+| extractor (Sonnet)              | $0.010365 | $0.013095 | $0.009309 | $0.008361 | $0.009309* |
+| scorer (Sonnet)                 | $0.009570 | $0.006057 | $0.006885 | $0.005940 | $0.010653* |
+| drafter (Opus 4.7) — initial    | —         | $0.054435 | $0.059040 | $0.062715 | — (rejected) |
+| critic (Haiku Mode-2) — initial | —         | $0.000000 | $0.001918 (2 calls) | $0.002782 (3 calls) | — |
+| drafter (Opus 4.7) — retry      | —         | —         | $0.065445 | $0.065175 | — |
+| critic (Haiku Mode-2) — retry   | —         | —         | $0.000986 (1 call)  | $0.000000 (chain held) | — |
+| **Total**                       | **$0.066029** | **$0.098515** | **$0.167251** | **$0.171341** | **$0.043630** |
+
+\* Plaid-rejection-run upstream-agent costs are the rejection run's
+own first-three-step costs (independent web_search results from the
+happy-path Plaid run); included for full audit honesty.
+
+### Range / mean / retry-rate (the ADR-006 §1 inputs)
+
+- **Range across four happy-path runs: $0.066029 – $0.171341.**
+- **Mean: $0.125784.** Excluding the gated Anthropic run (no Opus):
+  mean of the three drafter-bearing runs is **$0.145702**.
+- **Bounded-retry fire-rate: 2 of 3 drafter-invoked runs (66%).** Of
+  the firings, **retry succeeded once and failed once (50% recovery)**.
+  Slice 7's single live smoke had retry succeed; Slice 8's first
+  retry-fired run (Plaid) had retry fail — the bounded-retry edge
+  does NOT always recover, and the persistent-fabrication halt path
+  is real, not theoretical.
+- **Critic-firing rate: 2 of 3 drafter-invoked runs (66%).** Stripe's
+  first-contact-clean draft refutes Slice 5's prediction that "first
+  contact will always fail." See finding #1 below.
+
+### Audit-trail verification (Anthropic, workflow `49aba97a`)
+
+Verified end-to-end on the gated Anthropic run:
+
+- **`workflows` row** — status=`completed`, started_at + finished_at
+  stamped, cost_total_usd=$0.066029, metadata carries `company_name`.
+- **`workflow_steps` rows** — three rows (researcher / extractor /
+  scorer), each `completed` with cost_usd, output_ref pointing at the
+  matching JSONL line; sum of step costs equals workflow.cost_total_usd.
+- **`events` rows** — nine events in order: `workflow.started` →
+  three pairs of `step.started`/`step.completed` → `workflow.note`
+  (carrying `terminate_reason='score_gated'`) → `workflow.completed`.
+  Each step.completed carries its structured-data projection per
+  ADR-006 §1 (`{coverage, floor, gated_by, score, …}` for the scorer).
+- **JSONL telemetry** — three lines, one per LLM call (researcher /
+  extractor / scorer), each parsing cleanly with agent_name + model +
+  cost matching the workflow_steps row.
+
+The audit chain is intact on real data. The `output_ref`
+`data/logs/2026-05-15/49aba97a665247d2b37c2a168f7888d7.jsonl:N`
+resolves to a real file with the right line count. Cost rollup is
+arithmetically consistent. This is the audit-grade claim PATTERNS.md
+#5 demands, verified one more time on a real production-shape
+workflow.
+
+### Top calibration findings
+
+1. **Opus 4.7 first-contact behaviour is variable, not uniformly
+   over-reaching.** Slice 5's prediction was "first contact will fail
+   the substring check"; Stripe's first-contact draft was
+   substring-clean (critic produced zero Mode-2 calls, retry not
+   invoked). The pattern that distinguishes substring-clean from
+   over-reach appears to be claim-shape: Stripe's claims were
+   short and either category words ("fintech") or near-verbatim
+   long-form quotes ("more than 9,000 business leaders and
+   builders"). Plaid + Modal Labs' over-reaches were paraphrases of
+   longer grounded-quote spans — the same shape Slice 5 documented on
+   Anthropic ("Anthropic PBC" suffix drop, "teamed with" → "partnership
+   with"). Implication: the bounded-retry edge is necessary but not
+   sufficient on its own; the Drafter prompt could be tuned to prefer
+   short verbatim quotes (deferred — prompt-tuning is out of Slice 8
+   scope per the kickoff).
+
+2. **The bounded-retry edge fails to recover on real Tier-A inputs**
+   (Plaid persistent-fabrication halt). Plaid scored 100/100 / Tier A
+   and still hit the halt path: Opus's retry draft produced a new
+   substring failure even with the prior critique attached as
+   prompt context. This is the FIRST live observation of the halt
+   branch and validates that ADR-006 §1's policy ("second violation
+   → halt FAILED") was correct to bound retries at one. Open
+   question for the next operational pass: should the retry prompt
+   include MORE upstream context (e.g. the full RawSignals.signals
+   list, not just the dimension grounded_quotes), or is two-shot
+   retry the better lever? Either is an ADR-shaped decision, not a
+   Slice 8 change.
+
+3. **The decision-support footer on `run-crew` output is STALE — it
+   still says "four-agent crew" and "the verbatim substring-grounding
+   check is a Slice 7 (critic) responsibility — not enforced in this
+   run."** The critic is now wired and DOES enforce in every
+   `run-crew` invocation; the footer text was authored in Slice 6
+   when the critic did not yet exist and was not updated in Slice 7.
+   This is user-visible decision-support framing — PATTERNS.md #4
+   says it carries weight. **Not a measurement defect** (no false
+   audit claims; cost numbers and audit chain are correct) but a
+   real follow-up item. Recorded as a Phase 3 prep todo below.
+
+### ADR-vs-code divergence on the rejection path
+
+ADR-006 §1 (in the "Error / retry strategy" table) says: "checkpoint
+rejected → routes to a `terminate_no_draft` node that finalises the
+workflow as COMPLETED." Slice 6's implementation finalises operator
+rejections as **CANCELLED** (with `terminate_reason='rejected'`),
+documented in the `run-crew` docstring but NOT reconciled into the
+ADR. The Slice 6 STATUS section codified the CANCELLED choice; this
+calibration session confirms CANCELLED is what production does
+(verified live on the Plaid rejection run). Per the kickoff "if
+anything about the rejection path surprises you, STOP and report —
+that's a real finding," this is reported here. Resolution proposal
+(NOT executed in Slice 8): add a one-line ADR-006 amendment
+clarifying that operator-rejection finalises as CANCELLED while
+system-decided empty-outcomes (`score_gated`, `coverage_gated`)
+finalise as COMPLETED — both routes pass through
+`terminate_no_draft` but the workflow.status terminal differs by
+who made the decision. CANCELLED is operationally honest (an
+operator deliberately stopped a workflow that was otherwise valid);
+COMPLETED would conflate two structurally different empty-outcomes.
+
+### Budget posture
+
+`config/budgets.toml` `lead_enrichment` cap stays at **$10/day**.
+At the calibrated $0.066–$0.171 per full run, $10/day affords
+~58–150 runs/day — comfortable headroom for a freelance prospecting
+flow (target: 5–20 runs/day) without being so loose that a runaway
+loop would go unnoticed. The bundled rationale comment in
+budgets.toml records the calibration math. **Decision: no change to
+the cap.** Re-evaluate when (a) a real ICP rubric replaces the
+placeholder and the retry-fire rate stabilises, or (b) workload
+growth pushes daily volume above ~30 runs and the headroom narrows.
+
+### Phase 3 prep follow-ups (recorded — NOT actioned in Slice 8)
+
+- **WAL mode on SQLite** — ADR-002 §1 trigger condition; not yet hit
+  but rate-table verification / multi-process orchestration will
+  force it.
+- **Retry/backoff in `llm.py`** — Slice 8 ran cleanly with zero
+  infra retries needed (5 workflows, no API 5xx, no timeouts), so
+  the "wait for data before adding retry" posture from ADR-006 §1's
+  error-strategy table is vindicated for now. Calibrate again at
+  higher volume.
+- **Rate table verification** in `llm.py._RATES_USD_PER_MTOK` —
+  Open Question item since 2026-05-13; cross-check against the live
+  Anthropic pricing page.
+- **PII redaction** on user-visible Drafter prose — not exercised in
+  Slice 8 (no PII surfaced in any of the four real-company drafts)
+  but a buyer-pattern requirement for regulated-industry deployment.
+- **CREW_DECISION_FOOTER stale text** (finding #3 above) — one-line
+  update to reflect that the critic now enforces in `run-crew`.
+- **LangGraph msgpack deserialisation warnings** — three warnings
+  per resume (RawSignals / CompanyProfile / ScoredCompany); benign
+  today, blocking on a future LangGraph version. Existing Open
+  Question entry covers the trigger.
+- **Drafter prompt tuning for short verbatim quotes** (finding #1
+  above) — an ADR-shaped decision because it trades draft variety
+  for substring-clean first-contact rate.
+- **ADR-006 §1 rejection-path COMPLETED-vs-CANCELLED amendment**
+  (divergence above) — one-line ADR amendment.
+
+---
+
 **Phase 2 Slice 7 (Critic agent + bounded retry edge) — DONE
 2026-05-15.** New `src/agent_habitat/agents/critic.py` (Layer A
 `critic_node` + Layer B `run_critic`); `Critique` / `ClaimVerdict`

@@ -4,7 +4,7 @@
 Phase 1 — Habitat Infrastructure (full plan: docs/ROADMAP.md)
 
 ## Current Slice
-Slice 5 — CheckpointSystem (human-in-the-loop request/approve/reject + CLI) **— COMPLETE**
+Slice 6 — Demo agent: URL summarizer exercising the full habitat stack **— COMPLETE**
 
 ## Slice 1 Subtasks
 - [x] Scaffold project skeleton + plan docs
@@ -42,6 +42,29 @@ Slice 5 — CheckpointSystem (human-in-the-loop request/approve/reject + CLI) **
 - [x] `is_workflow_halted_by_budget()` — `json_extract`-backed halt-signal query for the Phase 2 orchestrator
 - [x] 40 deterministic tests in `tests/test_budget.py`; full suite (90 tests) passes, ruff + mypy strict clean
 
+## Slice 6 Subtasks
+- [x] `src/agent_habitat/agents/summarizer.py` — `run_summarizer`, `fetch_url`, `extract_readable_text`, `SummarizerResult`, `SummarizerError`; three synchronous steps (fetch / parse / summarize), Sonnet tier via `llm.complete()`, decision-support framing in the CLI output
+- [x] `src/agent_habitat/cli.py` — `run-summarizer URL` command reusing the `--db` pattern; non-zero exit on FAILED workflow
+- [x] Habitat integration: one workflow row + three step rows + the conventioned event sequence (`workflow.started`, `step.{started,completed}` ×3, `workflow.completed`) on success; FAILED workflow + `workflow.failed` + matching `step.failed` on any step failure, `finished_at` always stamped, no stuck-RUNNING workflows
+- [x] Cost path wired end to end: `LLMResult.cost_usd` → `workflow_steps.cost_usd` (summarize step) → `recompute_cost_total` → `workflows.cost_total_usd`; `output_ref` on the summarize step points at the JSONL line `llm.py` wrote
+- [x] 26 deterministic tests in `tests/test_summarizer.py` (httpx `MockTransport` for fetch, `unittest.mock.patch` for the LLM): fetch happy + 404 + network error + oversize + empty + bad scheme + bad URL; parse happy + script/style stripped + `<main>` preference + fallback + too-short rejected; happy run persists everything correctly; four failure paths (bad scheme, 404, network error, empty page, LLM error) end the workflow FAILED with the right step row + events; CLI happy + failure exits non-zero
+- [x] One live smoke (`@pytest.mark.live`) against `https://example.com/`: full round-trip verified, calibration observations captured (see "Slice 6 Live Smoke Calibration" below)
+- [x] Full suite (175 tests, including the live smoke) passes; ruff check + ruff format + mypy strict clean
+
+## Slice 6 Live Smoke Calibration
+
+One live run against `https://example.com/` on 2026-05-14 with Sonnet 4.6.
+Genuine observations a mocked test could not have surfaced — these feed the
+Slice 7 calibration story / README:
+
+- **Real cost: $0.001122** for the whole run (104 input tokens, 54 output tokens). That's ~0.06% of the configured `url_summarizer` $2/day cap. Even ~1800 trivial-page runs/day would not trip the cap — the cap is generous for short pages and only meaningful for longer documents or many calls.
+- **Input-token floor is dominated by the system prompt + boilerplate, not the page.** example.com's readable text is ~140 chars; the prompt still came in at 104 input tokens. Useful sizing intuition: cost-per-run has a non-trivial fixed floor regardless of how short the page is.
+- **Sonnet self-paced to ~3 sentences without truncation** (54 output tokens vs 512 cap, `stop_reason=end_turn`). The system-prompt instruction "three to five sentences in plain prose" held; no markdown leaked, no preamble. Encouraging for a prose contract that has to survive without an explicit JSON schema.
+- **`<main>`/`<article>` preference did NOT fire on the simplest real page.** example.com has neither tag, so the parser fell back to whole-soup extraction. The mocks asserted the *preference path* works; the *real* path on the simplest production URL is the fallback. Implication for Slice 7: invest more in the fallback's quality, since real-world pages skew toward unsemantic markup.
+- **Latency: 2.84s total**, dominated by the Sonnet call. The httpx fetch to example.com was sub-100ms; parse is negligible. LLM time is the binding latency — useful when reasoning about Phase 2 multi-agent pipelines (each agent call adds ~2s of LLM wall time even on trivial input).
+- **Eight events emitted in the expected order** — workflow.started → step.started/completed × 3 → workflow.completed. The taxonomy survived first contact with a real workload; no convention drift versus what Slice 4 documented.
+- **Telemetry round-trip is real.** The summarize step's `output_ref` (a path + line number) resolved to a JSONL record carrying `workflow_id`, `agent_name=url_summarizer`, `model=claude-sonnet-4-6`, both token counts, cost, and the full response text. This is the audit story working end-to-end on a real call rather than a fixture.
+
 ## Slice 5 Subtasks
 - [x] `checkpoint/system.py` — `request_checkpoint`, `approve_checkpoint`, `reject_checkpoint`, `get_checkpoint`, `list_pending_checkpoints`, `is_workflow_paused_for_checkpoint`; `Checkpoint` frozen dataclass, `CheckpointResolution` enum, `CheckpointError`
 - [x] Pending-approval record is additive on ADR-002's events table (request event id IS the checkpoint id; resolution events back-reference via `structured_data.checkpoint_id`) — no schema change
@@ -58,6 +81,16 @@ Slice 5 — CheckpointSystem (human-in-the-loop request/approve/reject + CLI) **
 - **Slice 3 "daily" definition resolved: UTC calendar day.** "Daily budget cap" = the half-open interval `[today 00:00:00 UTC, tomorrow 00:00:00 UTC)`. Caps reset at UTC midnight. Why UTC over rolling-24h or local-tz: aligns with the JSONL telemetry directory layout (`data/logs/YYYY-MM-DD/` already UTC), is trivially auditable, and makes window queries simple ISO-string range comparisons. Revisit if a workload needs per-tenant local-tz semantics.
 
 ## Last Session
+Implemented `src/agent_habitat/agents/summarizer.py` — the Slice 6 demo agent. Three synchronous steps (fetch / parse / summarize) hand-wired through the existing habitat: workflow + step rows via Slice 2's persistence, lifecycle and step events via Slice 4's `emit_event` over the canonical `EventType` taxonomy, the LLM call routed through `llm.py` (Sonnet tier — the kickoff prompt overrode STATUS.md's earlier "Haiku" note), and `recompute_cost_total` rolling the summarize step's real cost up onto `workflows.cost_total_usd`. The summarize step's `output_ref` points at the JSONL line `llm.py` wrote, so the audit chain `workflow → step → telemetry record` resolves end-to-end on the first real workload.
+
+Failure-path contract: any step error transitions the workflow to `FAILED` with `finished_at` stamped, emits a `step.failed` + `workflow.failed` pair, and returns a `SummarizerResult(status=FAILED, error_step, error_message)`. The agent never crashes uncaught from the caller's perspective, never leaves a workflow stuck in `RUNNING`. Exercised in tests across four real failure modes (bad URL scheme, 404, httpx network error, empty/SPA page) plus an injected LLM error — each one verifies the workflow row, the step row, and the event sequence.
+
+CLI surface: `agent-habitat run-summarizer URL [--db PATH] [--workflow-id ID]`. Reuses the Slice 5 `--db` pattern. Prints workflow id + status + cost + the summary, footer-disclaimed for decision-support framing (CLAUDE.md non-obvious constraint). Failed runs exit non-zero.
+
+Explicitly out of scope: no LangGraph (that's Phase 2), no checkpoint invocation (the summarizer has no flagged actions; Slice 5's system exists but isn't called), no active budget enforcement (cost is *recorded* so the existing budget primitives can find it — actually halting on exceed is the orchestrator's job). Per the kickoff prompt's hard stops, no new orchestration machinery was invented to make pieces fit.
+
+Tests: 26 deterministic in `tests/test_summarizer.py` (httpx `MockTransport` for fetch, `unittest.mock.patch` for the LLM call); full suite (175 tests including the new live smoke) passes; ruff check + ruff format + mypy strict all clean. One live smoke ran successfully against https://example.com/ — observations recorded under "Slice 6 Live Smoke Calibration" above.
+
 Implemented `src/agent_habitat/checkpoint/` — the CheckpointSystem. One package, one core module (`system.py`) plus the public-API `__init__.py`. The Slice 5 surface is six functions, one frozen dataclass, one enum, one exception:
 
   `request_checkpoint(conn, *, workflow_id, action, summary, proposed_payload=None, step_id=None, requested_by=None, now=None) → Checkpoint`
@@ -129,4 +162,4 @@ Slice 3's actual new work (per the kickoff prompt) was the budget-check + halt-s
 Tests: 40 deterministic tests in `tests/test_budget.py` — pure evaluator across boundary/edge cases (zero cap, threshold=0, threshold=1, at-cap, at-threshold); UTC window correctness including tz conversion and naive-datetime defensive path; `cost_within_window` inclusion/exclusion at boundaries and isolation across workflows; end-to-end check with override resolution; exceed-event row shape; halt-signal query including the "unrelated error event must not trip the halt" anti-confusion case; TOML config loading including missing file, malformed TOML, missing required key, missing [defaults] section, override without `daily_cap_usd`, threshold out of range, and a sanity-check that the bundled `config/budgets.toml` loads. Full suite (90 tests including llm.py and state) passes cleanly. ruff check + ruff format + mypy strict all clean.
 
 ## Next Session Entry Point
-Fresh session, Opus high. **Phase 1 Slice 6 — demo agent (URL summarizer).** First end-to-end workload riding the habitat: a single-agent workflow that fetches a URL via `httpx`, parses with `beautifulsoup4`, and summarises through `llm.py` (Haiku tier — pure grunt work, not Opus). The slice exercises every habitat primitive landed so far end-to-end: workflow + step rows via `state.persistence`, telemetry via `llm.py`, daily-budget check via `budget.check_workflow_budget` before each step, and (optionally) a `checkpoint.requested` before the workflow publishes its summary (proves the Slice 5 path under real load). Outputs a Markdown summary file; no orchestrator yet (Phase 2) — single-agent linear path is hand-wired in a thin script. Decision-support framing on the summary itself. Per CLAUDE.md tool discipline: `httpx` for fetch, `beautifulsoup4` for parsing; all LLM calls through `llm.py`. Budget cap for `url_summarizer` is already set to $2 in `config/budgets.toml`.
+Fresh session, Opus high. **Phase 1 Slice 7 — live API smoke across 3-5 URLs + Phase 1 README.** Slice 6 landed one live calibration data point (example.com); Slice 7 broadens it: pick 3-5 stable, varied URLs (a news article with semantic `<article>` markup, a long-form blog post, a corporate marketing page, a docs page, optionally one paywall/SPA to confirm the FAILED path) and run `run-summarizer` against each, capturing real input-token / output-token / cost / latency numbers per page-type. Roll the calibration table into a `README.md` for Phase 1 — the operator-facing pitch ("habitat infrastructure for production agents") plus the calibration story (what the live runs revealed that mocks couldn't, what's surprisingly cheap, where the `<main>` preference fires vs. falls back). Audit the Phase 1 surface for any rough edges the multi-URL run exposes. No new code unless a calibration finding demands it. After Slice 7: Phase 1 is shippable; Phase 2 begins.

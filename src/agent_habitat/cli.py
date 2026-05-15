@@ -1,11 +1,13 @@
 """agent-habitat command-line entry point.
 
-Click group with two surfaces today:
+Click group with three surfaces today:
 
   - `version`              — prints the package version (kickoff stub).
   - `checkpoint {list,show,approve,reject}`
                            — the operator-facing HITL approval surface
                              added in Slice 5.
+  - `run-summarizer URL`   — Slice 6 demo agent; runs the URL summarizer
+                             end-to-end through the habitat.
 
 The orchestrator surface lands in Phase 2.
 """
@@ -18,6 +20,7 @@ from pathlib import Path
 import click
 
 from agent_habitat import __version__
+from agent_habitat.agents import SummarizerResult, run_summarizer
 from agent_habitat.checkpoint import (
     Checkpoint,
     CheckpointError,
@@ -26,7 +29,7 @@ from agent_habitat.checkpoint import (
     list_pending_checkpoints,
     reject_checkpoint,
 )
-from agent_habitat.state import DEFAULT_DB_PATH, init_db
+from agent_habitat.state import DEFAULT_DB_PATH, WorkflowStatus, init_db
 
 
 # Decision-support framing operators see before approving. Keeps the
@@ -36,6 +39,15 @@ DECISION_SUPPORT_FOOTER = (
     "This summary is operational context for your approval decision. "
     "It is not legal, medical, or financial advice; verify the action "
     "and its consequences before approving."
+)
+
+#: Decision-support footer printed below the agent's summary output.
+#: Project posture: every consequential user-visible workflow output is
+#: structurally disclaimed (CLAUDE.md non-obvious constraint).
+SUMMARIZER_DECISION_FOOTER = (
+    "Automated summary; the model can omit, mis-emphasise, or misread "
+    "content. Treat as decision support, not as a substitute for reading "
+    "the source page."
 )
 
 
@@ -173,6 +185,62 @@ def cmd_reject(
     finally:
         conn.close()
     click.echo(f"Rejected checkpoint {cp.id} (workflow {cp.workflow_id} -> cancelled).")
+
+
+# ---------------------------------------------------------------------------
+# Slice 6: demo agent — URL summarizer
+# ---------------------------------------------------------------------------
+
+
+@main.command("run-summarizer")
+@click.argument("url")
+@click.option(
+    "--db",
+    "db_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=DEFAULT_DB_PATH,
+    show_default=True,
+    help="Path to the agent-habitat SQLite file.",
+)
+@click.option(
+    "--workflow-id",
+    default=None,
+    help="Override the generated workflow id (used for tests / reruns).",
+)
+def cmd_run_summarizer(url: str, db_path: Path, workflow_id: str | None) -> None:
+    """Run the Slice 6 demo agent: fetch, parse, and summarize a URL.
+
+    Exercises the full habitat stack end-to-end: workflow + steps + events
+    persisted, telemetry written through llm.py, cost rolled up. The summary
+    itself is printed to stdout with a decision-support footer.
+    """
+    conn = init_db(db_path)
+    try:
+        result = run_summarizer(conn, url=url, workflow_id=workflow_id)
+    finally:
+        conn.close()
+
+    click.echo(_format_summarizer_result(result))
+    if result.status is WorkflowStatus.FAILED:
+        raise click.exceptions.Exit(code=1)
+
+
+def _format_summarizer_result(result: SummarizerResult) -> str:
+    lines: list[str] = [
+        f"Workflow {result.workflow_id} — status: {result.status.value.upper()}",
+        f"URL      : {result.url}",
+        f"Cost USD : {result.cost_usd:.6f}",
+        "",
+    ]
+    if result.status is WorkflowStatus.COMPLETED and result.summary is not None:
+        lines.append("Summary:")
+        lines.append(result.summary)
+        lines.append("")
+        lines.append(SUMMARIZER_DECISION_FOOTER)
+    else:
+        lines.append(f"Failed at step: {result.error_step or '(unknown)'}")
+        lines.append(f"Error: {result.error_message or '(no message)'}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

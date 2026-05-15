@@ -1,6 +1,6 @@
 # ADR-003: Web search tool for the Researcher agent
 
-**Status:** Accepted (2026-05-14)
+**Status:** Accepted (2026-05-14) — **Addendum 2026-05-14** (cited_text grounding + cost recalibration; see end of file). The Decision is unchanged: Anthropic's built-in `web_search` server-side tool, single SDK call through `llm.py`. The Addendum corrects the *mechanism* (which response field the Researcher reads) and the *cost estimate*, on live evidence from Slice 2.
 
 ## Context
 
@@ -81,3 +81,91 @@ The Researcher's node body becomes one `llm.complete()` call with `tools=[{"type
 - Anthropic deprecates or substantially redesigns the `web_search` server-side tool. Re-evaluate Tavily as the most natural fall-back.
 - Phase 2 Slice 8 calibration shows result quality is materially worse than Tavily on the lead-enrichment workload (measured by signal-grounding rate per company, not by gut). Re-open with the calibration table as evidence.
 - A regulated-industry buyer requires that the search backend be a named, separately-contracted vendor (procurement-shape constraint, not technical). Switch to Tavily/Brave under their own SLA in that engagement; the encapsulation of the Researcher agent makes this a per-deployment swap, not a Phase 2 redesign.
+
+---
+
+## Addendum (2026-05-14): `cited_text` grounding + cost recalibration
+
+This addendum corrects two specifics in the original ADR-003 against live evidence from Phase 2 Slice 2's first real `web_search` call through the habitat (Anthropic's own public footprint; `claude-haiku-4-5-20251001`; 3 searches at `max_uses=3`; full round-trip persisted). **The Decision section above is unchanged** — Anthropic's built-in `web_search` server-side tool remains the chosen tool, for the same reasons. What changes is the *mechanism* (which field of the response the Researcher reads to build `RawSignals`) and the per-run *cost estimate*. Both came up at first contact with the live API; documenting them honestly is the audit-grade story.
+
+### 1. The corrected mechanism — `citations[].cited_text`, not raw `search_result` block content
+
+ADR-003's Decision section stated:
+
+> "Search-result content blocks are captured verbatim from the response into `RawSignals.signals[].text`."
+
+That premise **cannot be honoured literally** against the actual API response shape. Live verification on 2026-05-14:
+
+- The response carries `web_search_tool_result` blocks whose `.content[i]` items expose `url`, `title`, `page_age`, and `encrypted_content` — the first three are plain-readable, but `encrypted_content` is **opaque**. Anthropic designs it for multi-turn round-trip (the model can re-consume it in later turns); it is not intended for client-side persistence as readable text.
+- The plain-readable, substantively-equivalent grounding corpus is `TextBlock.citations[i].cited_text` from `CitationsWebSearchResultLocation` blocks — verbatim source spans the model surfaces, each tagged with its source URL and page title. These are *the same source content the search tool fetched*, surfaced through the citations channel rather than the encrypted block.
+- Slice 2's live smoke confirmed `cited_text` is genuine verbatim source prose (Bloomberg + PYMNTS spans like "May 12, 2026 at 9:08 PM UTC · Save · Anthropic PBC is in early talks with investors to raise at least $30 billion in fresh financing…"), **not** the model's own narrative paraphrase.
+
+**As-built code path** (the addendum documents, does not change):
+
+- `llm.py::_extract_web_search_citations` iterates `response.content`, picks `TextBlock`s, walks `block.citations`, and emits a typed `Citation(cited_text, source_url, source_title)` for every `CitationsWebSearchResultLocation` it finds.
+- `agents/researcher.py` builds each `Signal` from a `Citation`: `Signal(text=c.cited_text, source_url=c.source_url, source_title=c.source_title, retrieved_at=...)`. `Signal.text` is therefore a verbatim source span by construction.
+
+The substantive property ADR-003 needed (the corpus the substring check grounds against IS the text the model actually saw, not a paraphrase) **holds against `cited_text` for the same structural reason it would have held against raw block content**: both are tool-surfaced source content, not model output. The dual-source-of-truth hazard the alternatives section rejected Tavily/Brave for is still avoided — `cited_text` lives inside the same `messages.create` response, returned by the same single SDK call, and is persisted by one writer.
+
+### 2. The three grounding questions
+
+ADR-006 §3 (fabrication-resistance) and Slices 3 and 7 depend on the answers to three concrete questions about `cited_text` as a grounding corpus. Answered against the as-built code and the live smoke evidence:
+
+**Q1. Is `cited_text` reliably present on every result the Researcher keeps?**
+
+Yes, by SDK contract — `cited_text` is a required field on `CitationsWebSearchResultLocation`. The as-built `_extract_web_search_citations` reads `c.cited_text` without a None-check, and `Citation.cited_text: str` is a required Pydantic field; a missing/None value would surface as a Pydantic validation error at construction time, not as a silent empty `Signal`. The relevant absence question is upstream: a model response may carry **zero citations** (the model searched but did not ground any claim against a result, or did not search at all). The as-built path handles this correctly — `_extract_web_search_citations` returns `[]`, the Researcher builds `RawSignals(company_name=..., signals=[])`, the workflow finalises **COMPLETED** with `signal_count == 0` per ADR-006 §1's empty-outcome contract. Empty is a valid result, not a failure.
+
+**Q2. Is a `cited_text` span complete enough to ground a downstream claim against?**
+
+It depends on what the model chose to quote, and that is the right semantics. Live smoke spans were full sentences with date stamps and dollar figures — well above the floor needed for the substring check. In principle a span could be shorter (a phrase, a clause); Anthropic's documentation describes `cited_text` as "the verbatim quoted portion of the source," not "the full search-result snippet." The implications for ADR-006 §3's substring check:
+
+- A shorter span is a **tighter** grounding corpus, not a broken one. The check (`claim.text` normalised → substring of concatenated normalised `Signal.text`) is well-formed for any non-empty corpus.
+- A short fragment narrows what a drafter can legitimately cite from that signal — exactly the right pressure for fabrication-resistance. A drafter that wants to make a richer claim must either find a longer grounded span elsewhere in `RawSignals` or surface the claim through `CompanyProfile` (Slice 3) which carries its own structured spans.
+- Forward dependency for Slice 3 (Extractor) and Slice 7 (Critic): both should treat short-span signals as legitimate-but-narrow grounding, not as low-quality data to be ignored. The Critic's red-team smoke (ADR-006 §3 forward dependency) should include a fabrication-attempt that paraphrases beyond the boundaries of a short cited span — verifying the substring check rejects it.
+
+**Q3. Does ADR-006 §3's substring-check mechanism still work AS WRITTEN against `cited_text` spans, or does §3 need its own amendment?**
+
+**§3 still works as written; no ADR-006 amendment is required.** §3's language is: "every claim the drafter makes about the company MUST be a verbatim substring of one of the upstream agents' textual outputs," and names `RawSignals` as "raw search-result snippets, scraped page excerpts." `cited_text` spans satisfy that description — they are raw source content tied to a source URL, retrieved by the search tool, persisted verbatim. §3's mechanism (whitespace+case normalisation, pure-Python substring against the concatenated upstream prose) operates on `Signal.text` and does not care which response field that text came from. The contract is grounded in "verbatim source spans from upstream agents"; `cited_text` is verbatim source spans. **The only thing that changes is which response field the Researcher reads** — which is an ADR-003 concern, not an ADR-006 concern.
+
+One semantics implication of `cited_text` grounding that is worth ratifying explicitly here (rather than discovering it in Slice 7): **a model claim made without a citation produces no Signal**. The Researcher cannot fabricate a Signal from the model's uncited narrative; the only path from "model response" to `Signal.text` is via a citation. This is exactly the fabrication-resistance discipline the §3 contract is designed to enforce, applied one level upstream. Ratified.
+
+### 3. Cost recalibration — ~$0.067/run, not $0.035–$0.045
+
+ADR-003's Decision section estimated:
+
+> "$0.03 in search fees + ~3K input tokens of returned snippets (~$0.003) + ~1K input tokens of prompt/system (~$0.001) + ~500 output tokens (~$0.0025) ≈ **$0.035–$0.045 per researcher run**."
+
+Live smoke on 2026-05-14 measured **$0.066871** for the single run. Real breakdown:
+
+| Component | ADR-003 estimate | Live smoke |
+|---|---|---|
+| Search fees (3 × $0.01) | $0.030 | $0.030 |
+| Input tokens (Haiku $1/MTok) | ~3K → ~$0.003 | **34,971 → $0.034971** |
+| Output tokens (Haiku $5/MTok) | ~500 → $0.0025 | 380 → $0.0019 |
+| **Total** | **~$0.035–$0.045** | **$0.066871** |
+
+**Root cause:** ADR-003 modelled input tokens as a flat "~3K of snippet content + ~1K of prompt." The live API does not work that way. Anthropic's `web_search` injects substantial result content into the model's context as it reasons across multiple searches — the inline result text, the model's intermediate reasoning, and the cited spans all bill as input tokens on each turn. Input tokens ran **~10× the estimate** for a 3-search run; the fee component is ~45% of total but **input tokens are the bigger driver** (~52%), not the fees as the original ADR implied by ordering them first.
+
+**Downstream assumptions this touches** — explicitly flagged for re-check (not changed in this session):
+
+1. **`config/budgets.toml`'s `lead_enrichment` daily cap = $10.00.** At the corrected per-Researcher-run cost of ~$0.07 (and a projected 5-agent end-to-end cost of ~$0.10–$0.15 per company, per STATUS.md), $10/day still affords ~66–100 full-pipeline runs per day — likely still adequate for an operator-paced freelance workload, but the cap was set against the original $0.035–$0.045 estimate and **should be explicitly re-validated** when Slice 8 calibration produces real end-to-end numbers across all five agents. **No edit this session.**
+2. **ADR-006 §1 checkpoint cost-rationale.** §1's text reads: "the rest of the upstream chain at Haiku+Sonnet costs roughly $0.01–$0.02 combined." With the Researcher alone now at ~$0.07, the upstream chain (Researcher + Extractor + Scorer + Critic) is more honestly ~$0.07–$0.10 combined. The checkpoint break-even *logic* still holds — rejecting one in N low-scoring leads still saves the $0.025–$0.060 Opus draft cost — but the §1 text understates upstream cost by ~5×. **Forward dependency: re-check ADR-006 §1's checkpoint-rationale paragraph when Slice 8 calibration data lands**; either update the upstream-chain figure in §1 with the calibrated numbers, or note it as a known-stale figure with a pointer to the calibrated STATUS.md / Slice 8 README. **No edit this session.**
+3. **`_WEB_SEARCH_FEE_USD = 0.01` in `llm.py`.** Already flagged "NEEDS VERIFICATION against current Anthropic pricing" with a 2026-05-13 stamp; matches the recalibrated $0.030 search-fee component. No change.
+
+**Forward dependency for Slice 8 (live calibration)**: size the 5-agent pipeline budget cap and the README calibration table against the corrected per-Researcher-run cost (~$0.07), not the original ADR-003 figure.
+
+### 4. What still stands
+
+The core ADR-003 decision is **unchanged**, and every reason given for it survives the corrected mechanism:
+
+| Original reason ADR-003 chose Anthropic `web_search` | Status under `cited_text` grounding |
+|---|---|
+| One SDK call returns model output AND source content. | ✅ Unchanged — `cited_text` lives in the same `messages.create` response. |
+| Cost flows through `llm.py` unchanged; one writer to `workflow_steps.cost_usd`. | ✅ Unchanged — `compute_cost_usd` + the $0.01 server-tool fee land on `LLMResult.cost_usd` exactly as designed. |
+| Persisted text IS the corpus the substring check grounds against — no second source of truth. | ✅ Unchanged — `Signal.text` is built from `Citation.cited_text`; the substring check still grounds against tool-surfaced source content, not model paraphrase. The structural property holds for the same reason. |
+| No new API key, client, rate limit, billing surface. | ✅ Unchanged. |
+| Vendor lock-in to Anthropic accepted as bounded blast radius (Researcher encapsulated, handoff is `RawSignals`). | ✅ Unchanged — the swap cost is the same regardless of which response field the Researcher reads. |
+
+The alternatives (Tavily, Brave, custom httpx+BS4) are rejected for the same structural reasons. The "what would invalidate this decision" list also still applies.
+
+**Net:** the addendum corrects *how* ADR-003 is implemented (read `citations[].cited_text`, not `web_search_tool_result.content[i]`), records the recalibrated cost honestly, and confirms the original Decision and its rationale stand.

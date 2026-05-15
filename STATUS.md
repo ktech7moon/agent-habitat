@@ -177,8 +177,11 @@ Slice 7 calibration story / README:
 - [x] 30 deterministic tests in `tests/test_checkpoint.py`; full suite (149 tests) passes, ruff check + ruff format + mypy strict clean
 
 ## Open Questions
-- **ADR-003 premise needs an addendum — RawSignals grounds against `citations[].cited_text`, not raw `web_search_result` block content.** ADR-003 (Decision section + Forward dependency) stated: "Search-result content blocks are captured verbatim from the response into `RawSignals.signals[].text` (with the block's source URL into `.source_url`)." Live verification on 2026-05-14 showed the actual `web_search_tool_result.content[i].encrypted_content` is **opaque/encrypted** (Anthropic designs it for multi-turn round-trip; URL + title + page_age are plain but the snippet text is not). The plain-readable equivalent — and what the Researcher now uses — is `CitationsWebSearchResultLocation.cited_text` from the model's TextBlock citations: verbatim source spans tied to source URL + title that the model chose to ground a claim against. The grounding invariant ADR-006 §3 needs (Signal text = real source prose, not model narrative) holds by construction against `cited_text` — these spans are tool-surfaced source content, not the model's own phrasing. Open question for Joseph: write an ADR-003 addendum that (a) acknowledges the encrypted-block discovery, (b) names `citations[].cited_text` as the authoritative grounding corpus, (c) accepts the consequence that signals exist only for spans the model actually cited (a model claim made without a citation produces no signal — likely the right semantics for a fabrication-resistance contract, but worth ratifying explicitly). Source: Phase 2 Slice 2 live smoke calibration above.
-- **ADR-003 cost estimate was low by ~50%.** ADR-003 estimated $0.035-$0.045 per researcher run. Live calibration on 2026-05-14 measured $0.066871 (one run, 3 searches at `max_uses=3`). Driver: ADR-003 assumed ~3K input tokens; the live call ingested 34,971 input tokens because Anthropic's web_search injects substantial result content into the model's context as it reasons across searches. Implication: Slice 8 budget cap calibration must size against ~$0.07/Researcher-run, not ~$0.04. Phase 2 5-agent pipeline cost expectation revises to ~$0.10-$0.15 per company. Not a decision question — a numbers-update for Slice 8.
+- **ADR-003 premise — RESOLVED 2026-05-14** by the ADR-003 Addendum (`docs/adr/ADR-003-web-search-tool.md`, "Addendum (2026-05-14): `cited_text` grounding + cost recalibration"). The core ADR-003 decision (Anthropic `web_search`, single SDK call, cost through `llm.py`, no second client) stands; the addendum corrects the mechanism — Signals are built from `citations[].cited_text` rather than the opaque `web_search_tool_result.encrypted_content` — and ratifies the consequence that uncited model narrative produces no Signal (right fabrication-resistance semantics). ADR-006 §3's substring-check mechanism works as written against `cited_text` spans; **no ADR-006 amendment required**. Forward dependencies the addendum surfaced are recorded as their own entries below.
+- **ADR-003 cost recalibration — RESOLVED 2026-05-14** in the addendum's §3. Documented per-run cost is now ~$0.067 (real breakdown: $0.034971 input + $0.0019 output + $0.030 fee). The two downstream re-checks the recalibration forces are recorded as separate forward-dependency entries below; no decision pending here.
+- **Forward dependency from ADR-003 Addendum (Slice 3, Extractor): short `cited_text` spans are legitimate-but-narrow grounding.** A `cited_text` span may be a short fragment (clause / phrase), not always a full sentence — that is the right semantics, but it tightens what a downstream agent can legitimately ground against. Slice 3 should treat short-span Signals as legitimate grounding, not as low-quality data to be filtered. The Extractor's source-span tracking (each `CompanyProfile` field carries a substring reference into `RawSignals`) must be robust to short upstream spans. Slice 7 (Critic) should include a red-team smoke that paraphrases beyond the boundaries of a short cited span to verify the pure-Python substring check rejects it.
+- **Forward dependency from ADR-003 Addendum (Slice 8 / budgets.toml re-check).** `config/budgets.toml` `lead_enrichment` daily cap = $10.00 was set against the original $0.035–$0.045 per-Researcher-run estimate. At the recalibrated ~$0.07/Researcher-run and a projected ~$0.10–$0.15 per full 5-agent run, $10/day still affords ~66–100 full runs/day — likely still adequate but **explicitly unverified against the corrected numbers**. Re-validate the cap when Slice 8 produces real end-to-end cost numbers across all five agents. Not an emergency tightening; a calibration update.
+- **Forward dependency from ADR-003 Addendum (ADR-006 §1 checkpoint cost-rationale re-check).** ADR-006 §1's checkpoint placement rationale reads: "the rest of the upstream chain at Haiku+Sonnet costs roughly $0.01–$0.02 combined." With the corrected Researcher cost (~$0.07 alone), the upstream chain is more honestly ~$0.07–$0.10. The checkpoint break-even *logic* is unaffected (Opus draft cost $0.025–$0.060 dominates the savings calculus regardless), but §1's prose understates upstream cost by ~5×. When Slice 8 calibration data lands, either update §1's prose with the real number or attach a calibrated-figure pointer; do not silently leave the stale figure.
 - **Consolidate `llm.py`'s JSONL telemetry writer through the ObservabilityLayer.** Today `llm.py._append_telemetry` writes JSONL directly; Slice 4 added the conventioned READ side (`iter_telemetry`, `resolve_output_ref`) but did NOT touch the writer — `LLMResult` is a load-bearing contract and rule #14 forbids broad refactors without an ADR. Future work: either (a) route llm.py's writer through an ObservabilityLayer writer module so the path/line/format conventions live in one place, or (b) explicitly document the writer-stays-in-llm.py boundary as the chosen architecture. Trigger: any second writer of JSONL telemetry (Slice 5 checkpoint payloads? Phase 2 agent intermediate artefacts?) — that's the moment to centralise.
 - **Rate table needs verification.** `_RATES_USD_PER_MTOK` in `llm.py` uses best-known values (Haiku $1/$5, Sonnet $3/$15, Opus $15/$75 per MTok input/output) stamped 2026-05-13. Joseph: cross-check against the public Anthropic pricing page before relying on the cost numbers for any budget decision (Slice 3 enforcement is now wired but reads the same rate table).
 - **ADR-002 underspecification: `workflows.id` generation algorithm.** ADR-002 fixes the *relationship* (id is shared with LangGraph as `thread_id`) and the *type* (TEXT PRIMARY KEY) but does not name a generation method. Slice 2 defaults to `uuid.uuid4().hex` via `new_workflow_id()`; callers may override. Revisit with an ADR-002 addendum if Phase 2 needs sortable or time-prefixed ids (ULID, snowflake) for cheap range scans.
@@ -188,6 +191,71 @@ Slice 7 calibration story / README:
 - **`run_step()` utility — IMPLEMENTED 2026-05-14.** `src/agent_habitat/orchestration/run_step.py` ships the `StepRecorder` dataclass + `run_step()` context manager exactly per ADR-006 §2. Summarizer retrofitted onto it in the same commit; 20 deterministic tests in `tests/test_run_step.py`; all 196 deterministic tests pass; live smoke confirmed. Cosmetic trim (docstring, section dividers, WORKFLOW_TYPE/AGENT_NAME inlined) rode along. summarizer.py: 645 → 391 lines.
 
 ## Last Session
+ADR-003 Addendum — `cited_text` grounding correction + per-Researcher-run cost
+recalibration. **Documentation/decision only — zero code changes.**
+
+Appended an "Addendum (2026-05-14): `cited_text` grounding + cost recalibration"
+section to `docs/adr/ADR-003-web-search-tool.md`. The original ADR-003 Decision
+(Anthropic `web_search` server-side tool, single SDK call through `llm.py`, no
+second client) is unchanged; the addendum corrects the *mechanism* and the
+*cost estimate* against live evidence from Phase 2 Slice 2's first real
+`web_search` call.
+
+The corrected mechanism: ADR-003 said "persist the raw `search_result` block
+text into `RawSignals.signals[].text`." That premise cannot hold literally —
+`web_search_tool_result.content[i].encrypted_content` is opaque (Anthropic
+designs it for multi-turn round-trip, not client persistence). The
+plain-readable, substantively-equivalent grounding corpus is
+`CitationsWebSearchResultLocation.cited_text` — verbatim source spans the
+model surfaces via citations, each tied to source URL + title. The as-built
+code already does the right thing: `llm.py::_extract_web_search_citations`
+walks `TextBlock.citations`; `agents/researcher.py` builds each `Signal` from
+`Citation.cited_text`. The addendum documents this as the corrected ADR-003
+mechanism.
+
+The three grounding questions answered explicitly: (1) `cited_text` is reliably
+present on every citation the SDK surfaces (required field on
+`CitationsWebSearchResultLocation`); zero-citation responses correctly produce
+an empty `RawSignals` and a COMPLETED workflow per ADR-006 §1. (2) Span length
+is what the model chose to quote — could be short. A short span is a *tighter*
+grounding corpus, not a broken one; the substring check is well-formed for any
+non-empty span. Forward dependency recorded for Slice 3 / Slice 7. (3) ADR-006
+§3's substring-check mechanism works AS WRITTEN against `cited_text` spans;
+**no ADR-006 amendment is required**. Also explicitly ratified: a model claim
+made without a citation produces no Signal — the right fabrication-resistance
+semantics, now on the record.
+
+The cost recalibration: ADR-003 estimated $0.035–$0.045 per Researcher run;
+live smoke measured **$0.066871** for a 3-search run, ~50% higher. Real
+breakdown: $0.034971 input (34,971 tokens, ~10× the estimate) + $0.0019 output
+(380 tokens) + $0.030 fee (3 × $0.01). Driver: search-result content is
+injected into the model's context as it reasons across searches, not billed as
+a flat snippet load. The addendum flags exactly two downstream re-checks: (a)
+`config/budgets.toml` `lead_enrichment` cap ($10/day) needs re-validation
+against Slice 8's calibrated end-to-end numbers; (b) ADR-006 §1's
+checkpoint-rationale prose ("upstream chain ~$0.01–$0.02") understates upstream
+cost by ~5× and needs updating when Slice 8 data lands. **Neither change was
+made this session.**
+
+What still stands: the core ADR-003 decision (Anthropic `web_search`, single
+SDK call, `LLMResult.cost_usd` aggregation, no second client) and all four
+reasons given for it. The corrected mechanism preserves every structural
+property — same SDK call, same single writer, same one-source-of-truth for the
+substring check, same bounded vendor-lock-in blast radius.
+
+File outputs: `docs/adr/ADR-003-web-search-tool.md` (Status line updated +
+Addendum section appended), `docs/adr/README.md` (ADR-003 index row notes the
+addendum + the recalibrated cost), `STATUS.md` (two Open Questions resolved;
+two precise forward-dependencies recorded for Slice 8 and a §1 prose re-check;
+"Last Session" + "Next Session Entry Point" updated).
+
+No code changes. No `pip install`. No tests run — the addendum documents the
+as-built behaviour; the test suite has been clean since the Slice 2 commit
+(eac285c) and was not touched. Working tree before this session: clean except
+for an untracked `probe_web_search.py` (the live-probe artefact from Slice 2,
+left intentionally for reference; not part of this commit).
+
+## Prior Session
 Phase 2 Slice 2 (remainder) — Researcher agent + `llm.py` `tools=` passthrough +
 `RawSignals` model.
 
@@ -468,10 +536,21 @@ a source-span reference back into `RawSignals`), and mirrors
    plus one live smoke. Stress-test that extracted spans really
    substring-match into `RawSignals.signals[].text`.
 
-ADR-003 addendum (recorded under Open Questions: `cited_text` is the
-real grounding corpus) is a small documentation task — not blocking
-Slice 3. ADR-004 (ICP rubric format) must land BEFORE Slice 4 (Scorer),
-NOT Slice 3.
+ADR-003 Addendum (DONE 2026-05-14) ratified `citations[].cited_text` as
+the grounding corpus and recalibrated per-Researcher-run cost to ~$0.067;
+no ADR-006 amendment was required (§3's substring check works as written
+against `cited_text` spans). Two forward dependencies the addendum
+surfaced — `budgets.toml` re-validation and ADR-006 §1 prose re-check —
+are queued under Open Questions for Slice 8, not blocking Slice 3.
+ADR-004 (ICP rubric format) must land BEFORE Slice 4 (Scorer), NOT
+Slice 3.
+
+A Slice-3-relevant nuance from the addendum: `cited_text` spans may be
+short fragments (clause / phrase), not always full sentences. The
+Extractor's source-span tracking (each `CompanyProfile` field carrying a
+substring reference into `RawSignals`) must be robust to short upstream
+spans — short-span Signals are legitimate-but-narrow grounding, not
+low-quality data to filter out.
 
 `run_step()`, `llm.py` `tools=` passthrough, `RawSignals`, and the
 Researcher are DONE. No re-work needed there.

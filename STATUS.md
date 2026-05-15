@@ -45,4 +45,6 @@ _Tight current-state summary. The full build log (every slice retro, every decis
 
 ## Public release
 
-_Pending. Filled in by the post-flip update (Item 6 final step)._
+**Repository flipped from private to public on 2026-05-15** at commit [`e5e4054`](https://github.com/ktech7moon/agent-habitat/commit/e5e4054) (Phase 3 pre-flip audit). Public URL: <https://github.com/ktech7moon/agent-habitat>. The deliberate visibility flip closes Phase 3.
+
+What's next (outside the repo): record the Loom walkthrough within 7 days using [`docs/loom-script.md`](docs/loom-script.md) and add the link to the README in a follow-up commit. Substantive iteration after that follows real feedback — Phase 4 (second workload) is trigger-gated, not scheduled.

@@ -100,11 +100,13 @@ SCORER_DECISION_FOOTER = (
 #: surface, not in the prospect-facing text.
 DRAFTER_DECISION_FOOTER = (
     "Automated draft from an Opus 4.7 LLM. The model can fabricate, "
-    "over-claim, or mis-attribute; the enumerated claims trace to the "
-    "scoring chain but the substring-grounding check is a downstream "
-    "agent's job (Slice 7 critic). Verify every concrete claim against "
-    "the cited dimension before sending. Treat as decision support, "
-    "not as a sendable artefact."
+    "over-claim, or mis-attribute. The standalone `run-drafter` command "
+    "does NOT run the critic — fabrication-resistance enforcement (the "
+    "five-hop substring chain that catches ungrounded claims and halts "
+    "rather than ships) fires only inside the full crew via "
+    "`agent-habitat run-crew`. Verify every concrete claim against the "
+    "cited dimension before sending. Treat as decision support, not as "
+    "a sendable artefact."
 )
 
 

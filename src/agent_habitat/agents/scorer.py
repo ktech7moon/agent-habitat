@@ -57,6 +57,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -221,6 +222,25 @@ def _indent(text: str, n: int) -> str:
     """Indent every line by n spaces (for readable rubric prose in the prompt)."""
     pad = " " * n
     return "\n".join(pad + line for line in text.splitlines())
+
+
+@dataclass(frozen=True)
+class ScorerNodeOutput:
+    """Layer A return shape — what the pure scorer node produces.
+
+    The wrapper (`run_scorer`) applies `cost_usd` / `output_ref` /
+    `structured_data` onto the `run_step` recorder; the LangGraph
+    orchestrator (Phase 2 Slice 6) will do the same. `scored_company`
+    is the typed agent output the drafter / orchestrator-router consume.
+
+    `output_ref` is `None` on the all-gaps / no-scorable-fields short-
+    circuit (no LLM call, no JSONL line).
+    """
+
+    scored_company: ScoredCompany
+    cost_usd: float
+    output_ref: str | None
+    structured_data: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -557,6 +577,76 @@ def _all_excluded(
 
 
 # ---------------------------------------------------------------------------
+# Layer A — pure scorer node.
+# ---------------------------------------------------------------------------
+
+
+def scorer_node(
+    *,
+    profile: CompanyProfile,
+    rubric: RubricConfig,
+    workflow_id: str,
+    log_root: Path | None = None,
+) -> ScorerNodeOutput:
+    """Layer A: pure scorer logic.
+
+    No scorable fields (all-gaps profile, or no rubric dimension matches a
+    non-gap field) short-circuits to an all-excluded `ScoredCompany` with
+    NO LLM call (cost $0, no `output_ref`). Otherwise: one Sonnet call
+    covering the scorable dimensions, schema parse, per-dimension
+    substring-grounding — returning the typed `ScoredCompany` plus the
+    telemetry the wrapper (or LangGraph orchestrator) records onto its step.
+
+    Does NOT touch the database, does NOT call `run_step`, does NOT
+    insert/update workflows. Parse / schema / missing-dimension failures
+    raise `ScorerError` for the caller to convert into a FAILED step
+    (ADR-006 §1, Slice 1).
+
+    `workflow_id` flows through to `llm.complete()` for telemetry
+    attribution only — no workflow row is written here.
+    """
+    company_name = profile.company_name
+    scorable = _scorable_fields(profile, rubric)
+    if not scorable:
+        dimensions = _all_excluded(profile, rubric, reason="no_signals")
+        scored = _build_scored_company(company_name, dimensions, rubric)
+        return ScorerNodeOutput(
+            scored_company=scored,
+            cost_usd=0.0,
+            output_ref=None,
+            structured_data=_projection(scored),
+        )
+    llm_result = complete(
+        model_tier=ModelTier.SONNET,
+        messages=[
+            {
+                "role": "user",
+                "content": _build_user_prompt(
+                    company_name,
+                    profile,
+                    rubric,
+                    scorable_fields=scorable,
+                ),
+            }
+        ],
+        workflow_id=workflow_id,
+        agent_name=AGENT_NAME,
+        system=SYSTEM_PROMPT,
+        max_tokens=SCORER_MAX_TOKENS,
+        log_root=log_root,
+    )
+    parsed = _parse_llm_response(llm_result.content)
+    dimensions = _assemble_dimensions(profile, rubric, parsed.dimensions, scorable_fields=scorable)
+    scored = _build_scored_company(company_name, dimensions, rubric)
+    return ScorerNodeOutput(
+        scored_company=scored,
+        cost_usd=llm_result.cost_usd,
+        output_ref=llm_result.jsonl_ref,
+        structured_data=_projection(scored),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public entry point.
 # ---------------------------------------------------------------------------
 
@@ -571,6 +661,11 @@ def run_scorer(
     now: Callable[[], datetime] | None = None,
 ) -> ScorerResult:
     """Execute one scorer run end-to-end through the habitat.
+
+    Layer B wrapper: owns the workflow lifecycle and `run_step` audit
+    envelope, delegating the pure agent logic to `scorer_node`. The
+    LangGraph orchestrator (Phase 2 Slice 6) will wrap `scorer_node`
+    directly; this function preserves the standalone-CLI entry point.
 
     `rubric` is a pre-loaded `RubricConfig` (callers use `scoring.load_rubric`
     to read `config/rubric.toml`). Passing the rubric object rather than a
@@ -627,7 +722,6 @@ def run_scorer(
         gap_count=profile.gap_count,
     )
 
-    scorable = _scorable_fields(profile, rubric)
     fallback_scored = _build_scored_company(
         company_name, _all_excluded(profile, rubric, reason="no_signals"), rubric
     )
@@ -640,41 +734,17 @@ def run_scorer(
             agent_name=AGENT_NAME,
             now=clock,
         ) as step:
-            if not scorable:
-                # No scorable fields — either all-gaps profile or no rubric
-                # dimension matches a non-gap field. No LLM call.
-                dimensions = _all_excluded(profile, rubric, reason="no_signals")
-                scored = _build_scored_company(company_name, dimensions, rubric)
-                step.record_cost(0.0)
-            else:
-                llm_result = complete(
-                    model_tier=ModelTier.SONNET,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": _build_user_prompt(
-                                company_name,
-                                profile,
-                                rubric,
-                                scorable_fields=scorable,
-                            ),
-                        }
-                    ],
-                    workflow_id=wf_id,
-                    agent_name=AGENT_NAME,
-                    system=SYSTEM_PROMPT,
-                    max_tokens=SCORER_MAX_TOKENS,
-                    log_root=log_root,
-                )
-                parsed = _parse_llm_response(llm_result.content)
-                dimensions = _assemble_dimensions(
-                    profile, rubric, parsed.dimensions, scorable_fields=scorable
-                )
-                scored = _build_scored_company(company_name, dimensions, rubric)
-                step.record_cost(llm_result.cost_usd)
-                step.record_output_ref(llm_result.jsonl_ref)
-
-            step.record_structured_data(_projection(scored))
+            node_out = scorer_node(
+                profile=profile,
+                rubric=rubric,
+                workflow_id=wf_id,
+                log_root=log_root,
+            )
+            scored = node_out.scored_company
+            step.record_cost(node_out.cost_usd)
+            if node_out.output_ref is not None:
+                step.record_output_ref(node_out.output_ref)
+            step.record_structured_data(node_out.structured_data)
     except Exception as exc:
         finished = clock().isoformat()
         updated = workflow.model_copy(
@@ -762,6 +832,8 @@ __all__ = [
     "SYSTEM_PROMPT",
     "WORKFLOW_TYPE",
     "ScorerError",
+    "ScorerNodeOutput",
     "ScorerResult",
     "run_scorer",
+    "scorer_node",
 ]

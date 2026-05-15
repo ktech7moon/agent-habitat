@@ -15,6 +15,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
+
 import httpx
 import structlog
 from bs4 import BeautifulSoup
@@ -102,6 +104,28 @@ class _TruncationInfo:
     original_chars: int
     used_chars: int
     dropped_chars: int
+
+
+@dataclass(frozen=True)
+class SummarizerNodeOutput:
+    """Layer A return shape for the summarize step.
+
+    The wrapper (`run_summarizer`) applies `cost_usd` / `output_ref` /
+    `structured_data` (and the truncation extras when present) onto the
+    `run_step` recorder.
+
+    The summarizer is a 3-step intra-agent workflow (fetch / parse /
+    summarize); the first two pure layers already exist as `fetch_url`
+    and `extract_readable_text`. This dataclass is the third step's
+    pure-output carrier, kept consistent with the Phase 2 agents'
+    `*NodeOutput` shape.
+    """
+
+    summary: str
+    cost_usd: float
+    output_ref: str
+    structured_data: dict[str, Any]
+    truncation: _TruncationInfo
 
 
 class SummarizerError(Exception):
@@ -209,6 +233,68 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+def summarize_text(
+    readable: str,
+    *,
+    workflow_id: str,
+    log_root: Path | None = None,
+) -> SummarizerNodeOutput:
+    """Layer A: pure summarize-step logic.
+
+    Applies the MAX_PROMPT_CHARS truncation contract, calls
+    `llm.complete()` (Sonnet), and returns the typed summary plus the
+    telemetry the wrapper records onto its step. Wraps LLM exceptions
+    in `SummarizerError("summarize", ...)` so the caller's audit shape
+    (step `agent_name="summarize"` finalised FAILED) is preserved.
+
+    Does NOT touch the database, does NOT call `run_step`. `workflow_id`
+    flows through to `llm.complete()` for telemetry attribution only.
+    """
+    original_chars = len(readable)
+    used_chars = min(original_chars, MAX_PROMPT_CHARS)
+    dropped_chars = original_chars - used_chars
+    truncation = _TruncationInfo(
+        truncated=dropped_chars > 0,
+        original_chars=original_chars,
+        used_chars=used_chars,
+        dropped_chars=dropped_chars,
+    )
+    try:
+        llm_result = complete(
+            model_tier=ModelTier.SONNET,
+            messages=[{"role": "user", "content": readable[:MAX_PROMPT_CHARS]}],
+            workflow_id=workflow_id,
+            agent_name="url_summarizer",
+            system=SYSTEM_PROMPT,
+            max_tokens=SUMMARIZE_MAX_TOKENS,
+            log_root=log_root,
+        )
+    except Exception as exc:
+        raise SummarizerError("summarize", f"{type(exc).__name__}: {exc}") from exc
+
+    structured: dict[str, Any] = {
+        "input_tokens": llm_result.input_tokens,
+        "output_tokens": llm_result.output_tokens,
+        "truncated": llm_result.truncated,
+    }
+    if truncation.truncated:
+        structured.update(
+            {
+                "input_truncated": True,
+                "original_chars": truncation.original_chars,
+                "used_chars": truncation.used_chars,
+                "dropped_chars": truncation.dropped_chars,
+            }
+        )
+    return SummarizerNodeOutput(
+        summary=llm_result.content.strip(),
+        cost_usd=llm_result.cost_usd,
+        output_ref=llm_result.jsonl_ref,
+        structured_data=structured,
+        truncation=truncation,
+    )
+
+
 def run_summarizer(
     conn: sqlite3.Connection,
     *,
@@ -271,48 +357,13 @@ def run_summarizer(
         with run_step(
             conn, workflow_id=wf_id, step_index=3, agent_name="summarize", now=clock
         ) as step:
-            original_chars = len(readable)
-            used_chars = min(original_chars, MAX_PROMPT_CHARS)
-            dropped_chars = original_chars - used_chars
-            truncation = _TruncationInfo(
-                truncated=dropped_chars > 0,
-                original_chars=original_chars,
-                used_chars=used_chars,
-                dropped_chars=dropped_chars,
-            )
-            try:
-                llm_result = complete(
-                    model_tier=ModelTier.SONNET,
-                    messages=[{"role": "user", "content": readable[:MAX_PROMPT_CHARS]}],
-                    workflow_id=wf_id,
-                    agent_name="url_summarizer",
-                    system=SYSTEM_PROMPT,
-                    max_tokens=SUMMARIZE_MAX_TOKENS,
-                    log_root=log_root,
-                )
-            except Exception as exc:
-                raise SummarizerError("summarize", f"{type(exc).__name__}: {exc}") from exc
-
-            step.record_cost(llm_result.cost_usd)
-            step.record_output_ref(llm_result.jsonl_ref)
-            step.record_structured_data(
-                {
-                    "input_tokens": llm_result.input_tokens,
-                    "output_tokens": llm_result.output_tokens,
-                    "truncated": llm_result.truncated,
-                }
-            )
-            if truncation.truncated:
-                step.record_structured_data(
-                    {
-                        "input_truncated": True,
-                        "original_chars": truncation.original_chars,
-                        "used_chars": truncation.used_chars,
-                        "dropped_chars": truncation.dropped_chars,
-                    }
-                )
-            summary = llm_result.content.strip()
-            llm_ref = llm_result.jsonl_ref
+            node_out = summarize_text(readable, workflow_id=wf_id, log_root=log_root)
+            step.record_cost(node_out.cost_usd)
+            step.record_output_ref(node_out.output_ref)
+            step.record_structured_data(node_out.structured_data)
+            summary = node_out.summary
+            llm_ref = node_out.output_ref
+            truncation = node_out.truncation
 
     except SummarizerError as exc:
         finished = clock().isoformat()

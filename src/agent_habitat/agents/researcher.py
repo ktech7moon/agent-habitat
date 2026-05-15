@@ -19,7 +19,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import structlog
 from anthropic.types import ToolUnionParam, WebSearchTool20250305Param
@@ -87,6 +87,22 @@ def _web_search_tool(*, max_searches: int) -> list[ToolUnionParam]:
 
 
 @dataclass(frozen=True)
+class ResearcherNodeOutput:
+    """Layer A return shape — what the pure researcher node produces.
+
+    The wrapper (`run_researcher`) applies `cost_usd` / `output_ref` /
+    `structured_data` onto the `run_step` recorder; the LangGraph
+    orchestrator (Phase 2 Slice 6) will do the same. `raw_signals` is the
+    typed agent output that downstream agents (extractor) consume.
+    """
+
+    raw_signals: RawSignals
+    cost_usd: float
+    output_ref: str | None
+    structured_data: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class ResearcherResult:
     """What `run_researcher` returns. Mirrors the workflow it just wrote.
 
@@ -108,6 +124,62 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+def researcher_node(
+    *,
+    company_name: str,
+    workflow_id: str,
+    max_searches: int = DEFAULT_MAX_SEARCHES,
+    log_root: Path | None = None,
+    now: Callable[[], datetime] | None = None,
+) -> ResearcherNodeOutput:
+    """Layer A: pure researcher logic.
+
+    Makes one Haiku call with `web_search` enabled, builds `Signal` records
+    from `LLMResult.citations[].cited_text`, returns a `ResearcherNodeOutput`
+    carrying the typed `RawSignals` plus the telemetry the wrapper (or the
+    LangGraph orchestrator) records onto its step.
+
+    Does NOT touch the database, does NOT call `run_step`, does NOT
+    insert/update workflows. Infrastructure errors propagate as exceptions
+    for the caller to convert into a FAILED step (ADR-006 §1, Slice 1).
+
+    `workflow_id` flows through to `llm.complete()` for telemetry attribution
+    only — no workflow row is written here.
+    """
+    clock = now or _utcnow
+    llm_result = complete(
+        model_tier=ModelTier.HAIKU,
+        messages=[{"role": "user", "content": _user_prompt(company_name)}],
+        workflow_id=workflow_id,
+        agent_name=AGENT_NAME,
+        system=SYSTEM_PROMPT,
+        max_tokens=RESEARCHER_MAX_TOKENS,
+        tools=_web_search_tool(max_searches=max_searches),
+        log_root=log_root,
+    )
+    retrieved_at = clock()
+    signals = [
+        Signal(
+            text=c.cited_text,
+            source_url=c.source_url,
+            source_title=c.source_title,
+            retrieved_at=retrieved_at,
+        )
+        for c in llm_result.citations
+    ]
+    raw_signals = RawSignals(company_name=company_name, signals=signals)
+    return ResearcherNodeOutput(
+        raw_signals=raw_signals,
+        cost_usd=llm_result.cost_usd,
+        output_ref=llm_result.jsonl_ref,
+        structured_data={
+            "signal_count": raw_signals.signal_count,
+            "source_count": raw_signals.source_count,
+            "web_searches": llm_result.web_searches,
+        },
+    )
+
+
 def run_researcher(
     conn: sqlite3.Connection,
     *,
@@ -119,10 +191,18 @@ def run_researcher(
 ) -> ResearcherResult:
     """Execute one researcher run end-to-end through the habitat.
 
+    Layer B wrapper: owns the workflow lifecycle (insert_workflow,
+    finalise COMPLETED / FAILED, recompute_cost_total) and the
+    `run_step` audit envelope, delegating the pure agent logic to
+    `researcher_node`. The LangGraph orchestrator (Phase 2 Slice 6)
+    will wrap `researcher_node` directly; this function preserves the
+    standalone-CLI entry point.
+
     Returns a `ResearcherResult`. Infrastructure errors (LLM API failure,
     SQLite errors) propagate from `run_step` — the step is finalised FAILED,
     the workflow is finalised FAILED with `finished_at` stamped, and the
-    exception is re-raised. There are no retries (ADR-006 §1, Slice 1).
+    exception is caught here (not re-raised to the caller). No retries
+    (ADR-006 §1, Slice 1).
 
     Empty signals are NOT an error: the workflow finalises COMPLETED with
     a populated-but-empty `RawSignals` (ADR-006 §1 empty-outcome contract).
@@ -160,39 +240,19 @@ def run_researcher(
             agent_name=AGENT_NAME,
             now=clock,
         ) as step:
-            llm_result = complete(
-                model_tier=ModelTier.HAIKU,
-                messages=[{"role": "user", "content": _user_prompt(company_name)}],
+            node_out = researcher_node(
+                company_name=company_name,
                 workflow_id=wf_id,
-                agent_name=AGENT_NAME,
-                system=SYSTEM_PROMPT,
-                max_tokens=RESEARCHER_MAX_TOKENS,
-                tools=_web_search_tool(max_searches=max_searches),
+                max_searches=max_searches,
                 log_root=log_root,
+                now=clock,
             )
-
-            retrieved_at = clock()
-            signals = [
-                Signal(
-                    text=c.cited_text,
-                    source_url=c.source_url,
-                    source_title=c.source_title,
-                    retrieved_at=retrieved_at,
-                )
-                for c in llm_result.citations
-            ]
-            raw_signals = RawSignals(company_name=company_name, signals=signals)
-
-            step.record_cost(llm_result.cost_usd)
-            step.record_output_ref(llm_result.jsonl_ref)
-            step.record_structured_data(
-                {
-                    "signal_count": raw_signals.signal_count,
-                    "source_count": raw_signals.source_count,
-                    "web_searches": llm_result.web_searches,
-                }
-            )
-            llm_ref = llm_result.jsonl_ref
+            raw_signals = node_out.raw_signals
+            step.record_cost(node_out.cost_usd)
+            if node_out.output_ref is not None:
+                step.record_output_ref(node_out.output_ref)
+                llm_ref = node_out.output_ref
+            step.record_structured_data(node_out.structured_data)
     except Exception as exc:
         finished = clock().isoformat()
         updated = workflow.model_copy(

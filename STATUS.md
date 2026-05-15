@@ -4,7 +4,32 @@
 Phase 2 — 5-Agent Lead Enrichment Crew (full plan: docs/ROADMAP.md)
 
 ## Current Slice
-**Phase 2 Slice 4 (Scorer agent) — DONE 2026-05-14.** Three new
+**Pre-orchestrator refactor — DONE 2026-05-14.** Extracted pure Layer A
+node functions from the four built agents (researcher, extractor, scorer,
+summarizer) so Phase 2 Slice 6 (LangGraph orchestrator) can compose them
+cleanly. Behavior-preserving: four existing agent test suites pass UNCHANGED
+(0 test edits); 13 new Layer A tests added; ruff/format/mypy strict all
+clean; one live smoke (summarizer round-trip + Wikipedia truncation) green
+through the refactored standalone path.
+
+Each Phase 2 agent now exposes `<name>_node(...)` returning `<Name>NodeOutput`
+(typed agent output + cost_usd + output_ref + structured_data). The standalone
+`run_<name>(...)` wrapper preserves the workflow-lifecycle envelope
+(`insert_workflow` → `with run_step(...) as step: out = <name>_node(...);
+step.record_*(out.*)` → finalise COMPLETED/FAILED), so the CLI commands
+(`run-researcher`, `run-extractor`, `run-scorer`, `run-summarizer`) keep
+working identically. `cli.py` is untouched. The summarizer (a 3-step
+intra-agent workflow predating the crew) gets the same treatment via a new
+sibling `summarize_text(...)` returning `SummarizerNodeOutput`; its two
+already-pure helpers (`fetch_url`, `extract_readable_text`) stay as-is.
+
+Slice 6 (orchestrator) now inherits four Layer A pure node functions it
+can wrap as LangGraph nodes — the wrap is `with run_step(conn, ...) as
+step: out = <name>_node(state...); step.record_cost(out.cost_usd); ...;
+return {"<key>": out.<typed_output>}`. `run_step.py` is unchanged.
+
+## Phase 2 Slice 4 (Scorer agent) — DONE 2026-05-14
+Three new
 files (`src/agent_habitat/agents/scorer.py`,
 `src/agent_habitat/scoring/rubric.py`, `tests/test_scorer.py`),
 extensions to `agents/models.py` (`DimensionScore` + `ScoredCompany`)
@@ -427,6 +452,128 @@ Slice 7 calibration story / README:
 - **`run_step()` utility — IMPLEMENTED 2026-05-14.** `src/agent_habitat/orchestration/run_step.py` ships the `StepRecorder` dataclass + `run_step()` context manager exactly per ADR-006 §2. Summarizer retrofitted onto it in the same commit; 20 deterministic tests in `tests/test_run_step.py`; all 196 deterministic tests pass; live smoke confirmed. Cosmetic trim (docstring, section dividers, WORKFLOW_TYPE/AGENT_NAME inlined) rode along. summarizer.py: 645 → 391 lines.
 
 ## Last Session
+**Pre-orchestrator refactor — Layer A / Layer B split across the four
+built agents.** Opus 4.7 high, behavior-preserving refactor (working,
+tested code; bar = provably unchanged behavior, not "it works"). Four
+files reorganised; zero edits to the four existing agent test suites;
+13 new deterministic tests added for the pure Layer A node functions;
+one live summarizer round-trip + Wikipedia truncation smoke green
+through the refactored path.
+
+**The fused shape was the problem.** Each `run_<agent>` previously
+owned the entire workflow: `insert_workflow` + `run_step` + LLM call +
+parse/ground + `update_workflow` + `recompute_cost_total` + the
+WORKFLOW_COMPLETED/FAILED event. That is correct for a standalone CLI
+command but the wrong shape for LangGraph — the orchestrator wants
+NODE functions (pure functions taking typed input, returning typed
+output + telemetry to record). Without this refactor, Slice 6 would
+either duplicate heavily or force a painful four-agent refactor AFTER
+the graph was written.
+
+**The split — same-file siblings, no new modules.** Each agent file now
+exposes a `<name>_node(...)` returning a frozen `<Name>NodeOutput`
+dataclass (`raw_signals|profile|scored_company|summary`, `cost_usd`,
+`output_ref`, `structured_data`). The pure node:
+  - takes typed upstream input(s) + `workflow_id` (for `llm.complete()`
+    telemetry attribution only) + optional `log_root` + optional `now`.
+  - calls `llm.complete()`, parses, applies grounding checks.
+  - does NOT touch the database, NOT call `run_step`, NOT
+    insert/update workflows.
+  - raises on infrastructure error (the wrapper's job to convert
+    into a FAILED step).
+The standalone `run_<name>(...)` is now a thin wrapper: insert_workflow
+→ emit `workflow.started` → `with run_step(...) as step: out =
+<name>_node(...); step.record_cost(out.cost_usd); [maybe
+step.record_output_ref(out.output_ref);] step.record_structured_data(
+out.structured_data)` → finalise COMPLETED/FAILED. Same signature, same
+return type (`<Name>Result`), same persistence behaviour.
+
+**Summarizer treated for consistency, not because it's a crew node.**
+The summarizer is a 3-step intra-agent workflow (fetch / parse /
+summarize), not a candidate LangGraph node — its Layer A is the three
+pure work functions: `fetch_url` (already), `extract_readable_text`
+(already), and the new sibling `summarize_text(...) ->
+SummarizerNodeOutput`. The wrapper preserves three `with run_step(...)`
+blocks so the per-step audit shape is unchanged; the test that asserts
+`[s.agent_name for s in steps] == ["fetch", "parse", "summarize"]`
+passes verbatim.
+
+**The empty-input short-circuits stay inside Layer A.** Extractor's
+zero-signals branch (no LLM call, $0 cost, all-gaps profile,
+`output_ref=None`) and the scorer's no-scorable-fields branch (all-
+excluded ScoredCompany, no LLM call, `output_ref=None`) are properties
+of the agent logic, not of workflow plumbing. They sit on Layer A, with
+the wrapper's `if node_out.output_ref is not None: step.record_output_ref(...)`
+preserving exact behaviour.
+
+**Correctness oracle: the four existing test files were not edited.**
+The 179 existing tests (researcher 16 + extractor 53 + scorer 80 +
+summarizer 30, including 4 live smokes that ran with the API key set)
+all pass unchanged. Test patch targets (`patch.object(<agent>_mod,
+"complete", ...)`) work as-is because `complete` is still a module-level
+name in each agent file. Test imports (`AGENT_NAME`, `WORKFLOW_TYPE`,
+the various private helpers like `_normalise_for_substring`,
+`_ground_profile`, `_compute_composite`, etc.) all still resolve at the
+same locations. `cli.py` is untouched.
+
+**13 new Layer A tests in `tests/test_node_pure.py`** — each pure node
+function called without a `sqlite3.Connection`, with `complete()`
+patched, asserts: typed output, telemetry tuple shape, empty-input
+short-circuit (no LLM call for extractor/scorer), infrastructure-error
+propagation. Proves the layer is genuinely pure of the database.
+
+**Slice 6 (orchestrator) now inherits a clean wrap point.** Each Phase
+2 agent's LangGraph node will be roughly:
+```python
+def researcher_node_lg(state: CrewState) -> dict:
+    with run_step(conn, workflow_id=state["workflow_id"],
+                  step_index=1, agent_name="researcher") as step:
+        out = researcher_node(company_name=state["company_name"],
+                              workflow_id=state["workflow_id"])
+        step.record_cost(out.cost_usd)
+        if out.output_ref is not None:
+            step.record_output_ref(out.output_ref)
+        step.record_structured_data(out.structured_data)
+    return {"raw_signals": out.raw_signals}
+```
+No re-derivation of the prompt, parse, grounding, or projection — those
+live on the pure node. The Phase 2 §1 `CrewState` `TypedDict` and the
+graph wiring are still Slice 6's job (this refactor explicitly does
+NOT introduce CrewState as live code or any LangGraph imports — that
+is the next slice).
+
+**Split was clean for all four agents — no STOP-flag.** The Layer A /
+Layer B boundary fell naturally on each: prompt-construction +
+`complete()` + parse + ground + projection-build on one side; workflow
+envelope + `run_step` audit on the other. The summarizer's three-step
+shape is faithfully preserved by keeping three `with run_step` blocks
+in the wrapper rather than collapsing the three steps into one.
+
+File outputs: `src/agent_habitat/agents/researcher.py` (extracted
+`researcher_node` + `ResearcherNodeOutput`),
+`src/agent_habitat/agents/extractor.py` (extracted `extractor_node` +
+`ExtractorNodeOutput`), `src/agent_habitat/agents/scorer.py` (extracted
+`scorer_node` + `ScorerNodeOutput`), `src/agent_habitat/agents/summarizer.py`
+(extracted `summarize_text` + `SummarizerNodeOutput`),
+`tests/test_node_pure.py` (NEW — 13 deterministic Layer A tests).
+`tests/test_researcher.py`, `tests/test_extractor.py`,
+`tests/test_scorer.py`, `tests/test_summarizer.py` — UNCHANGED.
+`src/agent_habitat/cli.py` — UNCHANGED. `src/agent_habitat/orchestration/run_step.py`
+— UNCHANGED. `STATUS.md` updated.
+
+No `pip install`. No LangGraph imports. No new orchestration modules.
+No ADR-002 / ADR-006 / `llm.py` changes. The shared-models surface
+(`agents/models.py`) is untouched — only `agents/__init__.py` continues
+to re-export the public Result/Error types as before.
+
+Per-file diff (insertions / deletions):
+- `agents/researcher.py`: +92 / -32
+- `agents/extractor.py`:  +92 / -23
+- `agents/scorer.py`:     +108 / -36
+- `agents/summarizer.py`: +93 / -42
+- `tests/test_node_pure.py`: NEW (~340 lines)
+
+## Prior Session
 **Phase 2 Slice 4 — Scorer agent + `ScoredCompany` model + rubric
 loader.** Opus 4.7 high, slice implementation against ADR-004 as
 the blueprint. Built the Sonnet-tier Scorer consuming a
@@ -918,7 +1065,31 @@ Slice 3's actual new work (per the kickoff prompt) was the budget-check + halt-s
 Tests: 40 deterministic tests in `tests/test_budget.py` — pure evaluator across boundary/edge cases (zero cap, threshold=0, threshold=1, at-cap, at-threshold); UTC window correctness including tz conversion and naive-datetime defensive path; `cost_within_window` inclusion/exclusion at boundaries and isolation across workflows; end-to-end check with override resolution; exceed-event row shape; halt-signal query including the "unrelated error event must not trip the halt" anti-confusion case; TOML config loading including missing file, malformed TOML, missing required key, missing [defaults] section, override without `daily_cap_usd`, threshold out of range, and a sanity-check that the bundled `config/budgets.toml` loads. Full suite (90 tests including llm.py and state) passes cleanly. ruff check + ruff format + mypy strict all clean.
 
 ## Next Session Entry Point
-**Phase 2 Slice 5 — Drafter agent + `Draft` model.** Fresh session,
+**Two unblocked candidates — Joseph picks the sequencing.** The pre-
+orchestrator refactor (this session) leaves both ready:
+
+- **Phase 2 Slice 5 — Drafter agent + `Draft` model.** Natural next
+  build: completes the 5-agent chain on the standalone-CLI path (the
+  same Researcher → Extractor → Scorer → Drafter sequence, with the
+  Drafter as a fourth `run_drafter` Layer B wrapping a new
+  `drafter_node` Layer A from the start — no later refactor needed
+  because the pattern is now established).
+- **Phase 2 Slice 6 — LangGraph orchestrator.** Now genuinely cheap to
+  build: the four existing pure node functions wrap directly. Builds
+  the crew on Researcher / Extractor / Scorer / Summarizer-shaped
+  nodes (the Summarizer isn't a crew node; the Drafter slot is
+  empty until Slice 5 lands). Slice 6 could even land FIRST with a
+  placeholder/no-op drafter node so the topology lands before the
+  fifth agent — but the cleaner sequence is probably Slice 5 first so
+  Slice 6 has a real Drafter to wire in.
+
+**Recommendation — Slice 5 first, then Slice 6.** Reasons: (a) Slice 5
+is the smaller, more contained piece (one new agent + one new model);
+(b) it surfaces the first real Opus 4.7 per-Drafter cost number, which
+the Slice 8 budget recalibration wants; (c) Slice 6 with a real
+Drafter avoids placeholder-node code that gets thrown away. But the
+ordering is reversible — both unblocked.
+
 Opus high (slice implementation — but note the Drafter itself runs
 on **Opus 4.7**, the user-visible-quality tier; CLAUDE.md model
 routing table). Per ADR-006 §1 + ROADMAP:

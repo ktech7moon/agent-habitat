@@ -60,6 +60,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import structlog
 from pydantic import ValidationError
@@ -155,6 +156,25 @@ def _user_prompt(raw_signals: RawSignals) -> str:
         f"{body}\n\n"
         "Extract the structured profile. Output JSON only."
     )
+
+
+@dataclass(frozen=True)
+class ExtractorNodeOutput:
+    """Layer A return shape — what the pure extractor node produces.
+
+    The wrapper (`run_extractor`) applies `cost_usd` / `output_ref` /
+    `structured_data` onto the `run_step` recorder; the LangGraph
+    orchestrator (Phase 2 Slice 6) will do the same. `profile` is the
+    typed agent output the scorer / drafter consume.
+
+    `output_ref` is `None` on the empty-input short-circuit (no LLM call
+    was made, no JSONL line was written).
+    """
+
+    profile: CompanyProfile
+    cost_usd: float
+    output_ref: str | None
+    structured_data: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -299,6 +319,61 @@ def _projection(profile: CompanyProfile) -> dict[str, object]:
 
 
 # ---------------------------------------------------------------------------
+# Layer A — pure extractor node.
+# ---------------------------------------------------------------------------
+
+
+def extractor_node(
+    *,
+    raw_signals: RawSignals,
+    workflow_id: str,
+    log_root: Path | None = None,
+) -> ExtractorNodeOutput:
+    """Layer A: pure extractor logic.
+
+    Empty `raw_signals.signals` short-circuits to an all-gaps profile with
+    NO LLM call (cost $0, no `output_ref`). Non-empty input: one Sonnet
+    call, JSON parse, substring-grounding pass — returning the typed
+    `CompanyProfile` plus the telemetry the wrapper (or LangGraph
+    orchestrator) records onto its step.
+
+    Does NOT touch the database, does NOT call `run_step`, does NOT
+    insert/update workflows. Parse / schema / grounding failures raise
+    `ExtractorParseError` for the caller to convert into a FAILED step
+    (ADR-006 §1, Slice 1).
+
+    `workflow_id` flows through to `llm.complete()` for telemetry
+    attribution only — no workflow row is written here.
+    """
+    company_name = raw_signals.company_name
+    if raw_signals.signal_count == 0:
+        profile = _all_gaps_profile(company_name, reason="no_signals")
+        return ExtractorNodeOutput(
+            profile=profile,
+            cost_usd=0.0,
+            output_ref=None,
+            structured_data=_projection(profile),
+        )
+    llm_result = complete(
+        model_tier=ModelTier.SONNET,
+        messages=[{"role": "user", "content": _user_prompt(raw_signals)}],
+        workflow_id=workflow_id,
+        agent_name=AGENT_NAME,
+        system=SYSTEM_PROMPT,
+        max_tokens=EXTRACTOR_MAX_TOKENS,
+        log_root=log_root,
+    )
+    parsed = _parse_profile(llm_result.content, company_name)
+    profile = _ground_profile(parsed, raw_signals)
+    return ExtractorNodeOutput(
+        profile=profile,
+        cost_usd=llm_result.cost_usd,
+        output_ref=llm_result.jsonl_ref,
+        structured_data=_projection(profile),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public entry point.
 # ---------------------------------------------------------------------------
 
@@ -312,6 +387,11 @@ def run_extractor(
     now: Callable[[], datetime] | None = None,
 ) -> ExtractorResult:
     """Execute one extractor run end-to-end through the habitat.
+
+    Layer B wrapper: owns the workflow lifecycle and `run_step` audit
+    envelope, delegating the pure agent logic to `extractor_node`. The
+    LangGraph orchestrator (Phase 2 Slice 6) will wrap `extractor_node`
+    directly; this function preserves the standalone-CLI entry point.
 
     Empty `raw_signals.signals` short-circuits to an all-gaps profile with
     no LLM call — COMPLETED workflow, cost $0, projection records the all-
@@ -359,7 +439,6 @@ def run_extractor(
     )
 
     profile = _all_gaps_profile(company_name, reason="no_signals")
-    empty_input = raw_signals.signal_count == 0
 
     try:
         with run_step(
@@ -369,28 +448,16 @@ def run_extractor(
             agent_name=AGENT_NAME,
             now=clock,
         ) as step:
-            if empty_input:
-                # Empty signals are a VALID upstream outcome (ADR-006 §1).
-                # An all-gaps profile is the correct, honest extraction —
-                # no LLM call needed, no cost paid.
-                profile = _all_gaps_profile(company_name, reason="no_signals")
-                step.record_cost(0.0)
-            else:
-                llm_result = complete(
-                    model_tier=ModelTier.SONNET,
-                    messages=[{"role": "user", "content": _user_prompt(raw_signals)}],
-                    workflow_id=wf_id,
-                    agent_name=AGENT_NAME,
-                    system=SYSTEM_PROMPT,
-                    max_tokens=EXTRACTOR_MAX_TOKENS,
-                    log_root=log_root,
-                )
-                parsed = _parse_profile(llm_result.content, company_name)
-                profile = _ground_profile(parsed, raw_signals)
-                step.record_cost(llm_result.cost_usd)
-                step.record_output_ref(llm_result.jsonl_ref)
-
-            step.record_structured_data(_projection(profile))
+            node_out = extractor_node(
+                raw_signals=raw_signals,
+                workflow_id=wf_id,
+                log_root=log_root,
+            )
+            profile = node_out.profile
+            step.record_cost(node_out.cost_usd)
+            if node_out.output_ref is not None:
+                step.record_output_ref(node_out.output_ref)
+            step.record_structured_data(node_out.structured_data)
     except Exception as exc:
         finished = clock().isoformat()
         updated = workflow.model_copy(
@@ -469,9 +536,11 @@ def run_extractor(
 __all__ = [
     "AGENT_NAME",
     "EXTRACTOR_MAX_TOKENS",
+    "ExtractorNodeOutput",
     "ExtractorParseError",
     "ExtractorResult",
     "SYSTEM_PROMPT",
     "WORKFLOW_TYPE",
+    "extractor_node",
     "run_extractor",
 ]

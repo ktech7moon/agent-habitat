@@ -144,6 +144,24 @@ Honest scope. Phase 1 is real infrastructure, but it is not yet:
 - **A web UI.** Approvals are CLI today. A web surface is in the deferred list (see [CLAUDE.md](CLAUDE.md)), with an explicit trigger condition before it gets built.
 - **Backed by Postgres / Redis / Celery.** SQLite is sufficient for Phase 1–2; each deferred dependency has a named trigger condition.
 
+## Production Considerations
+
+agent-habitat is a framework. Deploying it into a production environment leaves several boundaries to the operator. These are explicit, not implicit.
+
+**1. Framework vs deployment boundary — PII handling lives at the observability layer.** Per-LLM-call JSONL telemetry stores the verbatim prompt and verbatim response. For workloads that process PII (names, emails, financial data, regulated content), redaction must be installed at the observability layer before deployment — extend the JSONL writer in `llm.py` or pre-process records in `observability/jsonl.py`. The framework does not ship a redaction step; the right rule set is workload- and jurisdiction-specific.
+
+**2. Human-in-the-loop is a primitive, not a turnkey approval system.** `CheckpointSystem` provides the durable, audit-logged approve/reject primitive that the orchestrator obeys: a flagged action pauses the workflow, writes an audit row, and waits for resolution. What ships in this repo is the *durable mechanism*. What does not ship: reviewer authentication and identity, notification fan-out (email, Slack, PagerDuty), an approval UI beyond the CLI, retention/deletion policy for resolved checkpoints, and "who approved this beyond log files" attestation. Those are deployment concerns; the audit row is the source of truth they should be built on top of.
+
+**3. The system sometimes halts rather than draft.** Slice 8 calibration produced one halt-on-persistent-fabrication run out of three drafter-invoked runs (Plaid, Tier-A score, retry failed). This is the framework operating as designed: the bounded fabrication-retry edge (ADR-006 §1) gives one chance to recover; persistent fabrication after that retry halts the workflow as FAILED rather than shipping prose with unverified claims. Operators see the halt with full audit trail (the violating draft, the critic's per-claim verdicts, the upstream signals the substring check ran against). The differentiator versus systems that ship dubious prose is exactly this halt branch. Calibration evidence: 2 of 3 drafter-invoked Slice 8 runs produced a usable draft (one without retry, one after a successful retry).
+
+**4. Single-writer assumption.** ADR-006 §1 picked sequential execution: one workflow at a time per process, no parallel agents inside a workflow. The persistence layer (ADR-002) and the telemetry writer (`llm.py::_append_telemetry`) assume single-writer-per-process today. Multiple workflows can run on the same database file from separate processes — WAL mode is enabled — but the in-memory line-count cache for telemetry assumes one writer per file. If you need genuinely concurrent workflows in one process, expect to add coordination at the persistence layer; if you need cross-process telemetry coordination, expect to add file-locking or move telemetry off-process.
+
+**5. LangGraph version pinning.** The orchestrator uses LangGraph's `SqliteSaver` for cross-session checkpoint resume (ADR-001, ADR-006 §1). The checkpoint format is LangGraph-version-specific and the project is pinned to `langgraph>=1.2,<2`. Resume across major LangGraph upgrades is **not** guaranteed; the pin is intentional. Before rolling forward in production, run a paused-and-resumed workflow end-to-end against the new version and verify the audit trail is intact. Treat any LangGraph major bump as its own ADR (per ADR-001).
+
+**6. Cost calibration date.** The rates in `llm.py::_RATES_USD_PER_MTOK` are verified as of **2026-05-15**. The Slice 8 calibration table in ADR-006 §1 was billed at the rates in effect at that time. **Opus 4.7 was repriced after Slice 8 ran** (from $15/$75 to $5/$25 per MTok), so Opus-bearing runs going forward will cost roughly 3× less than the Slice 8 numbers. Pricing changes invalidate the calibration; re-run a small calibration pass and bump the date stamp in `llm.py` after any rate change. The `_RATES_USD_PER_MTOK` table is the single point that needs editing.
+
+**7. Retry policy.** `llm.complete()` retries transient infrastructure errors (429, 5xx, network/timeout) up to two times with exponential backoff and Retry-After honouring on 429s — ADR-007. The retry budget is per LLM call; the fabrication-retry edge (ADR-006 §1) is a separate, independent budget at the orchestrator level. Persistent infrastructure failure (three transients in a row on the same call) halts the workflow as FAILED. Non-retryable errors (400/401/403/404/422) surface immediately without retry.
+
 ## Project layout
 
 ```

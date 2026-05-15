@@ -23,9 +23,11 @@ from agent_habitat import __version__
 from agent_habitat.agents import (
     ExtractorResult,
     ResearcherResult,
+    ScorerResult,
     SummarizerResult,
     run_extractor,
     run_researcher,
+    run_scorer,
     run_summarizer,
 )
 from agent_habitat.agents.models import PROFILE_FIELD_NAMES
@@ -37,6 +39,7 @@ from agent_habitat.checkpoint import (
     list_pending_checkpoints,
     reject_checkpoint,
 )
+from agent_habitat.scoring import DEFAULT_RUBRIC_PATH, RubricConfigError, load_rubric
 from agent_habitat.state import DEFAULT_DB_PATH, WorkflowStatus, init_db
 
 
@@ -68,6 +71,14 @@ EXTRACTOR_DECISION_FOOTER = (
     "Automated extraction; structured fields are grounded against the "
     "cited source spans shown but the model can omit, mis-attribute, or "
     "over-narrow. Treat as decision support, not as verified facts."
+)
+
+SCORER_DECISION_FOOTER = (
+    "Automated ICP scoring against an operator-authored rubric that is "
+    "itself an un-validated hypothesis. The score is renormalised over "
+    "scorable dimensions only; coverage tells you how much of the rubric "
+    "this run actually covered. Treat as decision support, not as a "
+    "ranking."
 )
 
 
@@ -381,6 +392,164 @@ def cmd_run_extractor(
     click.echo(_format_extractor_result(extractor_result))
     if extractor_result.status is WorkflowStatus.FAILED:
         raise click.exceptions.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
+# Slice 4 (Phase 2): Scorer agent
+# ---------------------------------------------------------------------------
+
+
+@main.command("run-scorer")
+@click.argument("company_name")
+@click.option(
+    "--db",
+    "db_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=DEFAULT_DB_PATH,
+    show_default=True,
+    help="Path to the agent-habitat SQLite file.",
+)
+@click.option(
+    "--rubric",
+    "rubric_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=DEFAULT_RUBRIC_PATH,
+    show_default=True,
+    help="Path to the ICP rubric TOML file (operator-tunable).",
+)
+@click.option(
+    "--max-searches",
+    default=3,
+    show_default=True,
+    type=int,
+    help="Researcher's web_search cap (forwarded to run-researcher).",
+)
+@click.option(
+    "--researcher-workflow-id",
+    default=None,
+    help="Override the Researcher workflow id (used for tests / reruns).",
+)
+@click.option(
+    "--extractor-workflow-id",
+    default=None,
+    help="Override the Extractor workflow id (used for tests / reruns).",
+)
+@click.option(
+    "--scorer-workflow-id",
+    default=None,
+    help="Override the Scorer workflow id (used for tests / reruns).",
+)
+def cmd_run_scorer(
+    company_name: str,
+    db_path: Path,
+    rubric_path: Path,
+    max_searches: int,
+    researcher_workflow_id: str | None,
+    extractor_workflow_id: str | None,
+    scorer_workflow_id: str | None,
+) -> None:
+    """Run the Scorer agent: produces a ScoredCompany from CompanyProfile + rubric.
+
+    Slice 4 has no orchestrator yet, so this CLI sequences three separate
+    workflows: Researcher (Haiku + web_search → RawSignals), Extractor
+    (Sonnet → CompanyProfile), then Scorer (Sonnet → ScoredCompany). If
+    any upstream agent fails, the downstream agents are not invoked. An
+    all-gaps profile from the Extractor is a VALID input to the Scorer
+    and produces a score=None / coverage=0 ScoredCompany (no LLM call).
+
+    Phase 2 Slice 6's LangGraph orchestrator will collapse these into one
+    workflow; for now keeping them separate keeps the audit story honest.
+    """
+    try:
+        rubric = load_rubric(rubric_path)
+    except RubricConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    conn = init_db(db_path)
+    try:
+        researcher_result = run_researcher(
+            conn,
+            company_name=company_name,
+            workflow_id=researcher_workflow_id,
+            max_searches=max_searches,
+        )
+        if researcher_result.status is WorkflowStatus.FAILED:
+            click.echo(_format_researcher_result(researcher_result))
+            raise click.exceptions.Exit(code=1)
+
+        extractor_result = run_extractor(
+            conn,
+            raw_signals=researcher_result.raw_signals,
+            workflow_id=extractor_workflow_id,
+        )
+        if extractor_result.status is WorkflowStatus.FAILED:
+            click.echo(_format_researcher_result(researcher_result))
+            click.echo("")
+            click.echo("=" * 60)
+            click.echo("")
+            click.echo(_format_extractor_result(extractor_result))
+            raise click.exceptions.Exit(code=1)
+
+        scorer_result = run_scorer(
+            conn,
+            profile=extractor_result.profile,
+            rubric=rubric,
+            workflow_id=scorer_workflow_id,
+        )
+    finally:
+        conn.close()
+
+    click.echo(_format_researcher_result(researcher_result))
+    click.echo("")
+    click.echo("=" * 60)
+    click.echo("")
+    click.echo(_format_extractor_result(extractor_result))
+    click.echo("")
+    click.echo("=" * 60)
+    click.echo("")
+    click.echo(_format_scorer_result(scorer_result))
+    if scorer_result.status is WorkflowStatus.FAILED:
+        raise click.exceptions.Exit(code=1)
+
+
+def _format_scorer_result(result: ScorerResult) -> str:
+    sc = result.scored_company
+    score_str = f"{sc.score:.2f}" if sc.score is not None else "None (no scorable dimensions)"
+    tier_str = sc.tier if sc.tier is not None else "(no tier — score is None)"
+    gated_str = (
+        sc.gated_by if sc.gated_by is not None else "(passed both gates — eligible for drafter)"
+    )
+    lines: list[str] = [
+        f"Workflow {result.workflow_id} — status: {result.status.value.upper()}",
+        f"Company  : {result.company_name}",
+        f"Cost USD : {result.cost_usd:.6f}",
+        f"Score    : {score_str}   (floor: {sc.floor:.1f})",
+        f"Coverage : {sc.coverage:.2%}      (min_coverage: {sc.min_coverage:.2%})",
+        f"Tier     : {tier_str}",
+        f"Gated by : {gated_str}",
+        "",
+    ]
+    if result.status is WorkflowStatus.COMPLETED:
+        lines.append("Per-dimension scores:")
+        for dim in sc.dimensions:
+            if dim.is_excluded:
+                lines.append(f"  {dim.field}  (weight {dim.weight:.2f}): EXCLUDED")
+                # Word-wrap reasoning for readability; keep it one logical block.
+                lines.append(f"    reason: {dim.reasoning}")
+            else:
+                assert dim.score is not None and dim.grounded_quote is not None
+                quote_preview = dim.grounded_quote.strip().replace("\n", " ")
+                if len(quote_preview) > 160:
+                    quote_preview = quote_preview[:160] + "…"
+                lines.append(f"  {dim.field}  (weight {dim.weight:.2f}): {dim.score:.1f}/5")
+                lines.append(f'    grounded_quote: "{quote_preview}"')
+                lines.append(f"    reasoning: {dim.reasoning}")
+            lines.append("")
+        lines.append(SCORER_DECISION_FOOTER)
+    else:
+        lines.append(f"Failed at step: {result.error_step or '(unknown)'}")
+        lines.append(f"Error: {result.error_message or '(no message)'}")
+    return "\n".join(lines)
 
 
 def _format_extractor_result(result: ExtractorResult) -> str:

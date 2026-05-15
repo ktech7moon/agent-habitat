@@ -4,23 +4,112 @@
 Phase 2 — 5-Agent Lead Enrichment Crew (full plan: docs/ROADMAP.md)
 
 ## Current Slice
-**ADR-004 — ICP rubric format and missing-data handling: ACCEPTED
-2026-05-14.** Phase 2 Slice 4 (Scorer) is now UNBLOCKED. The
-rubric TOML mirrors `config/budgets.toml`'s idiom ([defaults] + per-
-dimension override sections). The load-bearing decision is the
-missing-data handling: a `ProfileField` that is an `ExtractionGap` is
-EXCLUDED from the score and its weight is dropped from the
-denominator; the composite `score` is renormalised over the present
-dimensions, and a parallel `coverage` number (fraction of total
-rubric weight that was scorable) rides alongside. **ADR-006 §1's
-floor gates on `score`**; `min_coverage` is an OPTIONAL second gate
-(default 0.0 — off) operators turn up as confidence grows.
-**Grounding chain extends through the Scorer**: every per-dimension
-reasoning carries a `grounded_quote` that must substring-match one
-of the cited ProfileField's `source_spans` (whitespace-collapse +
-lowercase normalised) — the same pure-Python check shape Slice 3
-established. Phase 2 Slice 3 (Extractor) remains DONE 2026-05-14.
-Phase 1 remains shippable.
+**Phase 2 Slice 4 (Scorer agent) — DONE 2026-05-14.** Three new
+files (`src/agent_habitat/agents/scorer.py`,
+`src/agent_habitat/scoring/rubric.py`, `tests/test_scorer.py`),
+extensions to `agents/models.py` (`DimensionScore` + `ScoredCompany`)
+and `cli.py` (`run-scorer`); ADR-004 implemented as written.
+Renormalise-with-coverage scoring, grounding-chain extension
+(reusing Slice 3's `_normalise_for_substring` by import), per-
+dimension LLM scoring against the operator's prose rubric via one
+Sonnet call. 79 deterministic tests + 1 live smoke (PASSED first
+contact on Anthropic). Full suite (357 deterministic + 1 scorer
+live smoke) clean; ruff check + ruff format + mypy strict all
+clean. **Phase 2 Slice 5 (Drafter) is now UNBLOCKED.**
+
+## Phase 2 Slice 4 Subtasks (Scorer + ScoredCompany + rubric loader)
+- [x] `agents/models.py` extension — `DimensionScore` (per-dimension carrier: `field`, `weight`, `score | None`, `grounded_quote | None`, `reasoning`; scored↔excluded mutual-exclusivity validator), `ScoredCompany` (composite carrier: `score | None`, `coverage`, `floor`, `min_coverage`, `passed_floor`, `passed_coverage`, `tier | None`, `gated_by | None`, `dimensions: list[DimensionScore]`; tier-iff-score invariant), `TIER_VALUES` + `GATED_BY_VALUES` enums. All `ConfigDict(extra="forbid", frozen=True)`.
+- [x] `scoring/rubric.py` + `scoring/__init__.py` — `RubricConfig` + `DimensionConfig` Pydantic v2 models + `load_rubric()` over stdlib `tomllib` mirroring `budget/config.py`'s pattern. Validates: weights sum to 1.0 (epsilon 1e-9); every `field` is in `PROFILE_FIELD_NAMES`; `tier_a_min > tier_b_min > tier_c_min >= floor`; `missing_data_policy == "renormalise"` (Phase 2 sole option); all required `[defaults]` keys present; duplicate-field rejection across dimensions. Operator-debuggable errors path-named.
+- [x] `agents/scorer.py` — `run_scorer(conn, *, profile, rubric, ...)`, Sonnet tier via `llm.complete()` (no `llm.py` change), schema-in-system-prompt + `model_validate_json` per Slice 3's established structured-output choice, `run_step()` per ADR-006 §2. All-gaps profile / no-scorable-fields short-circuits to all-excluded ScoredCompany with NO LLM call (cost $0), step COMPLETED. Pure helpers (`_compute_composite`, `_assign_tier`, `_gating`, `_grounded_in_field`, `_assemble_dimensions`, `_all_excluded`) each unit-testable; `run_scorer` reads as a flat lifecycle.
+- [x] Renormalise-with-coverage scoring (ADR-004 §2) — `coverage = sum(d.weight for present)`; `score = (sum(d.score * d.weight for present) / coverage) * 20`; `score=None` iff no dimension is present. Gating: coverage-precedence when both gates fail (more informative empty-outcome).
+- [x] Grounding-chain extension (ADR-004 §3, ADR-006 §3) — each `DimensionScore.grounded_quote` substring-matches (whitespace-collapse + lowercase, REUSING Slice 3's `_normalise_for_substring` by import; not re-implemented) one of the cited `ProfileField.source_spans[].quote` values. Failure downgrades the dimension to excluded — same shape as Slice 3's `_ground_field` (gap-on-over-reach). The Scorer never lets a fabrication through.
+- [x] Projection mirrored onto `step.completed`: `{score, coverage, floor, min_coverage, passed_floor, passed_coverage, tier, gated_by}` per ADR-004 §5 + ADR-006 §1.3.
+- [x] `cli.py` — `agent-habitat run-scorer COMPANY_NAME [--db PATH] [--rubric PATH] [--max-searches N] [--*-workflow-id ID]` sequences Researcher → Extractor → Scorer as three separate workflows (Slice 6's orchestrator will unify them). `SCORER_DECISION_FOOTER` explicitly surfaces the coverage number (ADR-004 §2 + PATTERNS.md #4 — "this draft scored 75/100 against the rubric, but the rubric covered only 20% of the operator's stated ICP dimensions on this run"). FAILED rubric-load surfaces as a clean ClickException; FAILED scorer workflow exits non-zero.
+- [x] 79 deterministic tests in `tests/test_scorer.py` — rubric loader (15: valid + every documented failure mode incl. weights-not-summing-to-1, invalid field, mis-ordered tiers, missing defaults keys, invalid policy, no dimensions, duplicate fields, bundled-file sanity); model validation (15: DimensionScore + ScoredCompany scored/excluded/frozen/extra=forbid/round-trip); pure scoring math (12: full / partial / all-gaps coverage; every tier band; gating coverage-precedence + all-gaps both branches per ADR-004 Forward deps); grounding check (6: substring pass + normalisation + over-reach reject + gap-field + empty-quote + normaliser-identity); end-to-end agent (16: full happy run + projection mirror + step+events persistence; all-gaps short-circuit no LLM call; gap-heavy renormalisation; below-floor / below-coverage COMPLETED-not-failed; grounding-downgrade through the agent; code-fence stripping; malformed JSON / schema mismatch / missing dimension / extra dimension / API exception infrastructure failures); CLI (5: happy three-stage path; researcher / extractor / scorer failures each exit non-zero; missing rubric file fails cleanly).
+- [x] One live smoke (`@pytest.mark.live`) — see "Phase 2 Slice 4 Live Smoke Calibration" below.
+- [x] Full suite (357 deterministic + 1 scorer live smoke) passes; ruff check + ruff format --check + mypy strict all clean.
+
+## Phase 2 Slice 4 Live Smoke Calibration
+
+One live three-agent run against `Anthropic` on 2026-05-14
+(researcher: `claude-haiku-4-5-20251001` + web_search; extractor +
+scorer: `claude-sonnet-4-6`). The first real end-to-end audit-grade
+score on the full Researcher → Extractor → Scorer chain:
+
+- **Scorer cost: $0.009669** for one Sonnet call on the 3-of-5
+  scorable dimensions ($0.0097 is the project's first real per-Scorer-run
+  number; consistent with the ~$0.005-$0.010 projection range).
+  **Three-agent chain combined: $0.046176** (Researcher $0.025809 +
+  Extractor $0.010698 + Scorer $0.009669). Lower than the Slice 2/3
+  $0.073 total because the Researcher self-paced to 1 search this
+  run rather than hitting `max_searches=3`. The model decides when
+  to stop searching; `max_searches` is a cap, not a target.
+- **Wall-time: 7s for the Scorer**, ~18s for the full three-agent
+  chain. Consistent with Slice 2's "~15-25s end-to-end for 5
+  agents" projection.
+- **Score: 82.86 / coverage: 70% / tier: A / gated_by: None.** The
+  ScoredCompany passed both gates; an orchestrator with this output
+  would route to the drafter. Three dimensions scored at 3.0 / 5.0 /
+  5.0 (industry / tech_stack / recent_news); two dimensions excluded
+  (size + decision_makers — the Extractor returned gaps for them on
+  this run).
+- **THE SCORE-VS-COVERAGE SPREAD IS THE HEADLINE FINDING.** Score
+  82.86 reads as "Tier A — top band" in isolation. But coverage is
+  70% — the rubric was only judging 70% of the operator's stated
+  ICP dimensions. The `score × coverage = 0.58 → 58` collapsed-
+  composite that ADR-004 §A explicitly rejected would have flattened
+  this into a low-confidence "58/100" — which is exactly the
+  dual-source-of-truth failure ADR-004 §A names. The
+  renormalise-with-coverage policy preserves both signals: the score
+  reflects rubric quality on covered dimensions, the coverage flags
+  the operator that the ranking carries a 30%-of-rubric blind spot.
+  PATTERNS.md #4's coverage-aware decision-support framing
+  ("scored 82.86/100 against the rubric, but the rubric covered
+  only 70% of the operator's stated ICP dimensions on this run")
+  is exactly the disclosure the Drafter (Slice 5) needs to inherit.
+- **GROUNDING SURVIVED FIRST CONTACT — NO DOWNGRADES CAUGHT.** All
+  three LLM-scored dimensions' `grounded_quote` values substring-
+  matched (after normalisation) at least one of the cited
+  ProfileField's `source_spans[].quote` values. Different from the
+  Extractor's first live smoke (Slice 3) which caught two real
+  over-reaches: the Scorer's grounding corpus is tighter (already-
+  grounded ProfileField source_spans, not raw Signal text), so
+  over-reach is structurally harder. Watch on subsequent runs —
+  one data point is not yet calibration. The substring check is
+  load-bearing precisely because it would catch over-reach when it
+  occurs, not because it always does.
+- **Per-dimension calibration table** (full run, in
+  PROFILE_FIELD_NAMES canonical order):
+    `size            (w=0.20): EXCLUDED — field was an ExtractionGap`
+    `industry        (w=0.30): 3.0/5    — quote: "Anthropic launches Claude for Small Business"`
+    `tech_stack      (w=0.20): 5.0/5    — quote: "...Claude into tools like QuickBooks, PayPal..."`
+    `recent_news     (w=0.20): 5.0/5    — quote: "$30 billion in fresh financing"`
+    `decision_makers (w=0.10): EXCLUDED — field was an ExtractionGap`
+  The model's 3.0/5 industry score against the rubric prose's "5 —
+  fintech, healthcare, legal/compliance, insurance, regtech" band
+  is interesting — Anthropic is AI-safety/regulated-adjacent but
+  not literally fintech. The model picked the 3 band ("adjacent
+  regulated-adjacent — enterprise SaaS, dev tools with compliance
+  customers"). Calibration is honest, not deferential.
+- **The Scorer's audit chain holds end-to-end.** Workflow row + one
+  step row + four events (`workflow.started` → `step.started` →
+  `step.completed` → `workflow.completed`); step.completed
+  structured_data carries the full projection
+  `{score, coverage, floor, min_coverage, passed_floor,
+  passed_coverage, tier, gated_by}`; JSONL telemetry at `output_ref`
+  resolves to a real Sonnet response. The chain back from
+  `ScoredCompany.dimensions[i].grounded_quote` →
+  `CompanyProfile.<field>.source_spans[j].quote` →
+  `RawSignals.signals[k].text` → `Citation.cited_text` is
+  traceable end-to-end on the live run.
+- **Cost expectations updated.** A typical three-agent run lands at
+  **~$0.045-$0.075** depending on Researcher's self-paced search
+  count. Add the Opus Drafter ($0.025-$0.060) + Haiku Critic
+  (~$0.001) and a five-agent run lands at ~$0.07-$0.14 — consistent
+  with the Slice 3 projection. `lead_enrichment` $10/day affords
+  ~70-140 full runs. The forward-dependency `budgets.toml`
+  re-validation queued for Slice 8 can use this as one of the
+  inputs.
 
 ## Phase 2 ADR-004 Highlights
 - **TOML format mirrors `budgets.toml`'s idiom.** `[defaults]` for
@@ -338,6 +427,101 @@ Slice 7 calibration story / README:
 - **`run_step()` utility — IMPLEMENTED 2026-05-14.** `src/agent_habitat/orchestration/run_step.py` ships the `StepRecorder` dataclass + `run_step()` context manager exactly per ADR-006 §2. Summarizer retrofitted onto it in the same commit; 20 deterministic tests in `tests/test_run_step.py`; all 196 deterministic tests pass; live smoke confirmed. Cosmetic trim (docstring, section dividers, WORKFLOW_TYPE/AGENT_NAME inlined) rode along. summarizer.py: 645 → 391 lines.
 
 ## Last Session
+**Phase 2 Slice 4 — Scorer agent + `ScoredCompany` model + rubric
+loader.** Opus 4.7 high, slice implementation against ADR-004 as
+the blueprint. Built the Sonnet-tier Scorer consuming a
+`CompanyProfile` and a loaded `RubricConfig`, producing a
+`ScoredCompany` with renormalise-with-coverage scoring. Three new
+modules + extensions to two existing ones:
+
+- `agents/models.py` extended with `DimensionScore` (per-dimension
+  carrier with scored↔excluded mutual-exclusivity validator) and
+  `ScoredCompany` (composite + dimensions list + tier-iff-score
+  invariant). Both `extra="forbid", frozen=True`.
+- `scoring/rubric.py` (new) + `scoring/__init__.py` — rubric loader
+  via stdlib `tomllib` mirroring `budget/config.py`'s shape.
+  Validates weights-sum-1.0 (epsilon 1e-9), field validity against
+  `PROFILE_FIELD_NAMES`, tier ordering, `missing_data_policy ==
+  "renormalise"`, required defaults keys, duplicate-field rejection.
+  Operator-debuggable errors path-named.
+- `agents/scorer.py` (new) — `run_scorer(conn, *, profile, rubric,
+  ...)`, one Sonnet call (schema-in-system-prompt + Pydantic v2 parse,
+  same shape as Slice 3), `run_step()` per ADR-006 §2. Pure helpers
+  (`_compute_composite`, `_assign_tier`, `_gating`,
+  `_grounded_in_field`, `_assemble_dimensions`, `_all_excluded`).
+  All-gaps profile / no-scorable-fields short-circuits to all-excluded
+  ScoredCompany with no LLM call.
+- `cli.py` — `run-scorer` command sequencing Researcher → Extractor →
+  Scorer (three separate workflows for now; Slice 6 unifies via
+  orchestrator); `SCORER_DECISION_FOOTER` surfaces coverage
+  explicitly.
+
+**Grounding-chain extension landed cleanly.** Per-dimension
+`grounded_quote` substring-matches one of the cited `ProfileField`'s
+`source_spans[].quote` values (whitespace-collapse + lowercase),
+REUSING Slice 3's `_normalise_for_substring` by import — the kickoff
+constraint held. Over-reach downgrades the dimension to excluded
+(same shape as Slice 3's `_ground_field` downgrades a field to gap).
+A test (`test_check_uses_slice3_normaliser`) pins the import identity
+so future drift is caught.
+
+**ADR-004 spec implemented as written, no improvisation.** The
+all-gaps behaviour follows ADR-004 §5 Forward deps exactly
+(`score=None`, `coverage=0.0`, `passed_floor=False`,
+`gated_by="coverage"` if `min_coverage > 0` else `"score"`). The
+grounding-failure behaviour is "same shape as Slice 3's
+`_ground_field`" per ADR-004 §3 — downgrade-to-excluded, the direct
+analog of Slice 3's downgrade-to-gap. Coverage-precedence on the two
+gates makes a low-coverage run the more informative empty-outcome,
+matching ADR-004 §2's "calibration story can tell the two
+empty-outcomes apart."
+
+**79 deterministic tests + 1 live smoke.** Coverage: rubric loader
+(15 — valid + every documented failure mode incl. weights-sum-not-1,
+invalid field, mis-ordered tiers, missing defaults keys, invalid
+policy, no dimensions, duplicate fields, bundled-file sanity); model
+validation (15); pure scoring math + gating (12); grounding check (6,
+including the normaliser-identity check); end-to-end agent (16:
+happy + projection + persistence; all-gaps no-LLM-call;
+below-floor / below-coverage COMPLETED-not-failed; grounding
+downgrade; code-fence stripping; 5 infrastructure-failure paths);
+CLI (5: happy three-stage + 3 failures + missing rubric). All pass;
+ruff check + ruff format + mypy strict all clean. Full suite (357
+deterministic + 1 scorer live smoke) green.
+
+**Live smoke caught real calibration data.** Anthropic as the
+subject; 18s wall-time for the three-agent chain;
+$0.046 combined cost (Scorer $0.0097 first real number); score
+82.86, coverage 70%, tier A. Headline finding: **the
+score-vs-coverage spread is the structurally honest disclosure
+ADR-004 was designed to surface.** Score 82.86 (Tier A) on its own
+would read as "top band"; coverage 70% reveals the rubric was only
+judging 70% of the operator's stated ICP dimensions. The collapsed-
+composite the ADR rejected would have flattened this to 58/100,
+losing the signal. Five-hop grounding chain traceable end-to-end on
+the real call. NO grounding-downgrades caught on first contact — one
+data point, watch on later runs (Scorer's grounding corpus is
+tighter than Extractor's by construction, so over-reach is
+structurally harder; the substring check is load-bearing in case it
+occurs, not because it always does).
+
+File outputs: `src/agent_habitat/agents/scorer.py` (new),
+`src/agent_habitat/scoring/__init__.py` (new),
+`src/agent_habitat/scoring/rubric.py` (new),
+`src/agent_habitat/agents/models.py` (+ `DimensionScore` /
+`ScoredCompany` / `TIER_VALUES` / `GATED_BY_VALUES`),
+`src/agent_habitat/agents/__init__.py` (export surface updated),
+`src/agent_habitat/cli.py` (`run-scorer` command +
+`SCORER_DECISION_FOOTER` + formatter), `tests/test_scorer.py` (79
+deterministic + 1 live smoke), `STATUS.md` updated.
+
+No `pip install`. No `llm.py` / `run_step.py` / ADR-002 /
+`RawSignals` / `CompanyProfile` changes; Slice 3's normaliser
+imported, not modified. No `budgets.toml` / `rubric.toml`
+operator-config edits (the bundled `config/rubric.toml` is the
+ADR-004 format template; operator tunes it).
+
+## Prior Session
 **ADR-004 — ICP rubric format and missing-data handling.** Fresh
 session, Opus high, ADR-only. Settled three coupled decisions: (1)
 the TOML wire format mirrors `config/budgets.toml`'s idiom — no
@@ -734,67 +918,68 @@ Slice 3's actual new work (per the kickoff prompt) was the budget-check + halt-s
 Tests: 40 deterministic tests in `tests/test_budget.py` — pure evaluator across boundary/edge cases (zero cap, threshold=0, threshold=1, at-cap, at-threshold); UTC window correctness including tz conversion and naive-datetime defensive path; `cost_within_window` inclusion/exclusion at boundaries and isolation across workflows; end-to-end check with override resolution; exceed-event row shape; halt-signal query including the "unrelated error event must not trip the halt" anti-confusion case; TOML config loading including missing file, malformed TOML, missing required key, missing [defaults] section, override without `daily_cap_usd`, threshold out of range, and a sanity-check that the bundled `config/budgets.toml` loads. Full suite (90 tests including llm.py and state) passes cleanly. ruff check + ruff format + mypy strict all clean.
 
 ## Next Session Entry Point
-**Phase 2 Slice 4 — Scorer agent + `ScoredCompany` model + rubric
-loader.** Fresh session, Opus high (slice implementation). ADR-004
-(`docs/adr/ADR-004-icp-rubric-format.md`) is the blueprint.
+**Phase 2 Slice 5 — Drafter agent + `Draft` model.** Fresh session,
+Opus high (slice implementation — but note the Drafter itself runs
+on **Opus 4.7**, the user-visible-quality tier; CLAUDE.md model
+routing table). Per ADR-006 §1 + ROADMAP:
 
-Slice 4 scope (from ADR-004's "Forward dependencies handed to Slice
-4" section):
-- Build the `ScoredCompany` Pydantic v2 model. Required carry:
-  `score`, `coverage`, `floor`, `min_coverage`, `passed_floor`,
-  `passed_coverage`, `tier`, `gated_by | null`, and a
-  `dimensions: list[DimensionScore]` where each `DimensionScore`
-  carries `field`, `weight`, `score | None`, `grounded_quote | None`,
-  `reasoning`.
-- Implement `src/agent_habitat/agents/scorer.py` —
-  `run_scorer(conn, *, profile, rubric_path, ...)`. Sonnet tier via
-  `llm.complete()` (no `llm.py` change expected — re-use the
-  Extractor's structured-output method: schema-in-system-prompt +
-  `model_validate_json(LLMResult.content)` per
-  `docs/adr/ADR-004-icp-rubric-format.md` §5 + "Forward
-  dependencies"). Wire through `run_step()` per ADR-006 §2.
-- Implement a small rubric loader. On load: validate weights sum to
-  1.0; every `field` is in `PROFILE_FIELD_NAMES`; tier thresholds
-  form a valid `tier_a_min > tier_b_min > tier_c_min >= floor`
-  ordering; `missing_data_policy = "renormalise"` (only option in
-  Phase 2). Bundled `config/rubric.toml` is the format template;
-  Slice 4 wires up the loader against it.
-- Implement the missing-data renormalisation logic (ADR-004 §2):
-  iterate dimensions in `PROFILE_FIELD_NAMES` canonical order; for
-  each, check `ProfileField.is_gap`; if gap, exclude (record
-  `score=null`, drop weight from denominator); else LLM-score against
-  the dimension's `prose` and the field values, require a
-  `grounded_quote`, run the substring check (re-use Slice 3's
-  whitespace/case normalisation helper — do NOT invent a second
-  normaliser).
-- Empty / all-gaps `CompanyProfile` is a valid input: `score`
-  undefined (no dimensions covered), `coverage = 0.0`,
-  `passed_floor = false`, route to `terminate_no_draft` regardless.
-- Mirror `{score, coverage, floor, min_coverage, passed_floor,
-  passed_coverage, tier, gated_by | null}` onto `step.completed`.
-- CLI: `agent-habitat run-scorer COMPANY_NAME [--db PATH]
+Slice 5 scope (from ADR-006 §4 "Forward dependencies handed to Slice
+5"):
+- Build the `Draft` Pydantic v2 model. ADR-006 lists the projection
+  `{paragraph_count, char_count}` but does not name fields; Slice 5
+  owns them. At minimum: outreach prose plus enough structure that
+  the Slice 7 Critic can decompose it into claims. Match the
+  existing `extra="forbid", frozen=True` conventions.
+- Implement `src/agent_habitat/agents/drafter.py` —
+  `run_drafter(conn, *, raw_signals, profile, scored_company,
+  workflow_id, ...)`. **Opus 4.7 tier** via `llm.complete()` (no
+  `llm.py` change expected). The Drafter sees `(raw_signals,
+  profile, scored_company)` — the union of upstream prose — so the
+  drafter's claim language can later substring-check against any of
+  the three (ADR-006 §3 grounding corpus). Wire through `run_step()`
+  per ADR-006 §2.
+- The Slice 5 Drafter does NOT yet integrate the fabrication-
+  resistance retry loop (that's Slice 7 with the Critic). The
+  contract here is: produce a Draft + the structured-data
+  projection. ADR-006 §1 says input to the Drafter on retry will
+  include `Critique.violations`; the Drafter's prompt should make
+  room for that input but Slice 5 doesn't yet ship the retry path
+  (Slice 6 orchestrator + Slice 7 Critic do).
+- Decision-support framing: PATTERNS.md #4 says the drafter's
+  output must be structurally disclaimed with the `coverage`
+  number — "this draft scored 82.86/100 against the rubric, but
+  the rubric covered only 70% of the operator's stated ICP
+  dimensions on this run." Slice 4's live smoke proved this is
+  the right shape; Slice 5 implements it on the user-visible
+  surface.
+- CLI: `agent-habitat run-drafter COMPANY_NAME [--db PATH]
   [--rubric PATH] [--max-searches N] [--*-workflow-id ID]` —
-  sequences Researcher → Extractor → Scorer as three separate
-  workflows (Slice 6's orchestrator unifies them); decision-support
-  footer with the `coverage` number explicitly surfaced (ADR-004 §2
-  + PATTERNS.md #4).
-- Deterministic tests for: rubric loader (weights-sum, field
-  validity, tier ordering, missing keys, malformed TOML, default
-  `min_coverage`); per-dimension scoring including gap exclusion;
-  composite score renormalisation; coverage computation; substring
-  grounding pass + over-reach reject; floor + min_coverage gating
-  (both gates, score-only, coverage-only); tier assignment; empty
-  / all-gaps profile path; infrastructure failure (malformed JSON
-  / bad schema); CLI happy + researcher/extractor/scorer failures.
-- One live smoke against a real `CompanyProfile` from Slice 3's
-  pipeline. Record the per-dimension calibration table in STATUS.md
-  — score-vs-coverage spread is the headline finding; record cost
-  and wall-time too.
-- Full suite + ruff check + ruff format --check + mypy strict must
-  all be clean.
+  sequences Researcher → Extractor → Scorer → Drafter as four
+  separate workflows (Slice 6's orchestrator unifies them).
+  Decision-support footer with the coverage disclosure baked in.
+- Score-below-floor + coverage-below-min handling: per ADR-006 §1,
+  these are the orchestrator's job (terminate_no_draft routing
+  via Slice 6). For Slice 5's CLI, the cleanest shape is to skip
+  the Drafter call when `scored_company.gated_by is not None` and
+  print a clearly-labelled "no draft" outcome (workflow COMPLETED,
+  not FAILED). This previews the orchestrator's behaviour without
+  building it.
+- Deterministic tests: model validation; Drafter happy run +
+  audit chain + projection; Drafter skipped when scorer gates;
+  infrastructure failure (malformed/empty response); CLI happy +
+  upstream failures. One live smoke; record cost (first real Opus
+  4.7 number for the chain) + draft prose preview + the
+  coverage-aware disclosure in the output. Full suite + ruff +
+  mypy strict must all be clean.
+- Mind the **Opus pricing recalibration** (Open Questions):
+  ADR-006 §1's per-drafter cost estimate is $0.025-$0.060; Slice
+  5's live smoke is the first chance to verify this against Opus
+  4.7's actual pricing ($15/$75 per MTok). Record the real number
+  in STATUS.md; the recalibration may feed the Slice 8
+  budget re-validation.
 
 Two forward dependencies remain queued for Slice 8 (Open
 Questions): `budgets.toml` re-validation against real end-to-end
-cost, and ADR-006 §1's checkpoint-rationale prose re-check
-(upstream-chain cost figure is ~5× understated). Neither blocks
-Slice 4.
+cost (now with Slice 4's three-agent number as one input), and
+ADR-006 §1's checkpoint-rationale prose re-check (upstream-chain
+cost figure is ~5× understated). Neither blocks Slice 5.

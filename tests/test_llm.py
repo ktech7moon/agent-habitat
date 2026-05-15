@@ -109,12 +109,52 @@ class TestLLMResultModel:
             output_tokens=5,
             cost_usd=0.000035,
             jsonl_ref="data/logs/2026-05-13/wf.jsonl:1",
+            stop_reason="end_turn",
         )
         assert r.content == "hello"
         assert r.input_tokens == 10
         assert r.output_tokens == 5
         assert r.cost_usd == pytest.approx(0.000035)
         assert r.jsonl_ref == "data/logs/2026-05-13/wf.jsonl:1"
+        assert r.stop_reason == "end_turn"
+        assert r.truncated is False
+
+    def test_stop_reason_defaults_none(self) -> None:
+        r = LLMResult(
+            content="x",
+            model="claude-haiku-4-5-20251001",
+            input_tokens=1,
+            output_tokens=1,
+            cost_usd=0.0,
+            jsonl_ref="p:1",
+        )
+        assert r.stop_reason is None
+        assert r.truncated is False
+
+    def test_truncated_when_max_tokens(self) -> None:
+        r = LLMResult(
+            content="x",
+            model="claude-haiku-4-5-20251001",
+            input_tokens=1,
+            output_tokens=32,
+            cost_usd=0.0,
+            jsonl_ref="p:1",
+            stop_reason="max_tokens",
+        )
+        assert r.truncated is True
+
+    def test_truncated_false_for_other_stop_reasons(self) -> None:
+        for reason in ("end_turn", "stop_sequence", "tool_use", None):
+            r = LLMResult(
+                content="x",
+                model="claude-haiku-4-5-20251001",
+                input_tokens=1,
+                output_tokens=1,
+                cost_usd=0.0,
+                jsonl_ref="p:1",
+                stop_reason=reason,
+            )
+            assert r.truncated is False, f"reason={reason!r} should not be truncated"
 
     def test_frozen(self) -> None:
         r = LLMResult(

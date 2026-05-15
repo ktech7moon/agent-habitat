@@ -27,7 +27,7 @@ import structlog
 from anthropic import Anthropic
 from anthropic.types import MessageParam, TextBlock
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 load_dotenv()
 
@@ -75,6 +75,20 @@ class LLMResult(BaseModel):
             "Durable before complete() returns."
         ),
     )
+    stop_reason: str | None = Field(
+        default=None,
+        description=(
+            "Raw Anthropic Message.stop_reason — 'end_turn', 'max_tokens', "
+            "'stop_sequence', 'tool_use', etc. None only if the API returned "
+            "no stop_reason (should not happen for a successful call)."
+        ),
+    )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def truncated(self) -> bool:
+        """Convenience: true iff the response was cut off by max_tokens."""
+        return self.stop_reason == "max_tokens"
 
 
 def compute_cost_usd(tier: ModelTier, input_tokens: int, output_tokens: int) -> float:
@@ -180,6 +194,7 @@ def complete(
     input_tokens = response.usage.input_tokens
     output_tokens = response.usage.output_tokens
     cost_usd = compute_cost_usd(model_tier, input_tokens, output_tokens)
+    stop_reason = response.stop_reason
 
     now = datetime.now(UTC)
     record: dict[str, Any] = {
@@ -190,6 +205,7 @@ def complete(
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cost_usd": cost_usd,
+        "stop_reason": stop_reason,
         "response_text": content,
     }
     path = _telemetry_path(root, workflow_id, now)
@@ -212,4 +228,5 @@ def complete(
         output_tokens=output_tokens,
         cost_usd=cost_usd,
         jsonl_ref=jsonl_ref,
+        stop_reason=stop_reason,
     )

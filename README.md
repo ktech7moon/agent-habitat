@@ -2,6 +2,8 @@
 
 **Audit-grade multi-agent orchestration. Fabrication-resistance enforced as a validated contract, not a hope. Built for environments where _"we don't really know what the agent did"_ is not an acceptable answer.**
 
+When the critic detects an unverifiable claim in a generated draft, the workflow halts as FAILED rather than ships. This isn't a hypothetical: in live calibration against Plaid (a real Tier-A scored fintech), the framework halted the run after two drafter attempts produced claims the substring-grounding check couldn't verify — at both old and new Opus pricing, in two separate calibration passes. Every reason for the halt — violating drafts, per-claim verdicts, the upstream signals the substring check ran against — is queryable from cold storage with no LLM in the loop.
+
 agent-habitat runs a five-agent lead-enrichment crew end-to-end with persistent state, per-LLM-call cost telemetry, a human approval checkpoint before any user-visible draft is generated, and a critic agent that walks a five-hop substring chain over every claim the drafter makes — halting the workflow rather than shipping prose it can't ground.
 
 The product is the habitat itself, not any specific workload. The lead-enrichment crew is the first workload exercising it; future workloads (research synthesis, code review, compliance triage) ride on the same infrastructure.

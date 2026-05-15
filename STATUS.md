@@ -4,7 +4,7 @@
 Phase 1 — Habitat Infrastructure (full plan: docs/ROADMAP.md)
 
 ## Current Slice
-Slice 4 — ObservabilityLayer (unified event emission + structlog config + thin JSONL read) **— COMPLETE**
+Slice 5 — CheckpointSystem (human-in-the-loop request/approve/reject + CLI) **— COMPLETE**
 
 ## Slice 1 Subtasks
 - [x] Scaffold project skeleton + plan docs
@@ -42,6 +42,14 @@ Slice 4 — ObservabilityLayer (unified event emission + structlog config + thin
 - [x] `is_workflow_halted_by_budget()` — `json_extract`-backed halt-signal query for the Phase 2 orchestrator
 - [x] 40 deterministic tests in `tests/test_budget.py`; full suite (90 tests) passes, ruff + mypy strict clean
 
+## Slice 5 Subtasks
+- [x] `checkpoint/system.py` — `request_checkpoint`, `approve_checkpoint`, `reject_checkpoint`, `get_checkpoint`, `list_pending_checkpoints`, `is_workflow_paused_for_checkpoint`; `Checkpoint` frozen dataclass, `CheckpointResolution` enum, `CheckpointError`
+- [x] Pending-approval record is additive on ADR-002's events table (request event id IS the checkpoint id; resolution events back-reference via `structured_data.checkpoint_id`) — no schema change
+- [x] Workflow state transitions: RUNNING → PAUSED on request; PAUSED → RUNNING on approve; PAUSED → CANCELLED (terminal, `finished_at` stamped) on reject
+- [x] One pending checkpoint per workflow — a second request on a still-paused workflow raises
+- [x] `cli.py` extended with `checkpoint {list,show,approve,reject}` group; `--db` option on the group; decision-support footer on pending `show` output; `CheckpointError` surfaces as a clean `click.ClickException`
+- [x] 30 deterministic tests in `tests/test_checkpoint.py`; full suite (149 tests) passes, ruff check + ruff format + mypy strict clean
+
 ## Open Questions
 - **Consolidate `llm.py`'s JSONL telemetry writer through the ObservabilityLayer.** Today `llm.py._append_telemetry` writes JSONL directly; Slice 4 added the conventioned READ side (`iter_telemetry`, `resolve_output_ref`) but did NOT touch the writer — `LLMResult` is a load-bearing contract and rule #14 forbids broad refactors without an ADR. Future work: either (a) route llm.py's writer through an ObservabilityLayer writer module so the path/line/format conventions live in one place, or (b) explicitly document the writer-stays-in-llm.py boundary as the chosen architecture. Trigger: any second writer of JSONL telemetry (Slice 5 checkpoint payloads? Phase 2 agent intermediate artefacts?) — that's the moment to centralise.
 - **Rate table needs verification.** `_RATES_USD_PER_MTOK` in `llm.py` uses best-known values (Haiku $1/$5, Sonnet $3/$15, Opus $15/$75 per MTok input/output) stamped 2026-05-13. Joseph: cross-check against the public Anthropic pricing page before relying on the cost numbers for any budget decision (Slice 3 enforcement is now wired but reads the same rate table).
@@ -50,6 +58,52 @@ Slice 4 — ObservabilityLayer (unified event emission + structlog config + thin
 - **Slice 3 "daily" definition resolved: UTC calendar day.** "Daily budget cap" = the half-open interval `[today 00:00:00 UTC, tomorrow 00:00:00 UTC)`. Caps reset at UTC midnight. Why UTC over rolling-24h or local-tz: aligns with the JSONL telemetry directory layout (`data/logs/YYYY-MM-DD/` already UTC), is trivially auditable, and makes window queries simple ISO-string range comparisons. Revisit if a workload needs per-tenant local-tz semantics.
 
 ## Last Session
+Implemented `src/agent_habitat/checkpoint/` — the CheckpointSystem. One package, one core module (`system.py`) plus the public-API `__init__.py`. The Slice 5 surface is six functions, one frozen dataclass, one enum, one exception:
+
+  `request_checkpoint(conn, *, workflow_id, action, summary, proposed_payload=None, step_id=None, requested_by=None, now=None) → Checkpoint`
+  `approve_checkpoint(conn, checkpoint_id, *, reviewer, note=None, now=None) → Checkpoint`
+  `reject_checkpoint(conn, checkpoint_id, *, reviewer, reason=None, now=None) → Checkpoint`
+  `get_checkpoint(conn, checkpoint_id) → Checkpoint | None`
+  `list_pending_checkpoints(conn, workflow_id=None) → list[Checkpoint]`
+  `is_workflow_paused_for_checkpoint(conn, workflow_id) → bool`
+
+Pending-approval storage decision: ADDITIVE on ADR-002's events table — no schema change. The `checkpoint.requested` event's `events.id` IS the checkpoint id; resolution events (`checkpoint.approved` / `checkpoint.rejected`) carry `structured_data.checkpoint_id` back-referencing the request. A checkpoint is pending iff no resolution row references it — expressed in SQL via `NOT EXISTS (SELECT 1 FROM events e2 WHERE json_extract(...) = e1.id)`. Same idiom Slice 3 uses for `is_workflow_halted_by_budget`. ADR-002 already supports this shape (Consequences section explicitly named "Slice 5 (CheckpointSystem)" as the prototype for `level='approval'` rows over the events table), so no addendum was needed.
+
+Workflow state machine: `request` flips `workflows.status` to PAUSED; `approve` flips it back to RUNNING; `reject` flips it to CANCELLED with `finished_at` stamped (terminal). Halt-signal query (`is_workflow_paused_for_checkpoint`) consults only the events table, not `workflows.status` — same pattern as the budget halt-signal, so the signal stays correct even if a status update lags. One pending checkpoint per workflow is enforced at the API boundary: a second request on a still-paused workflow raises `CheckpointError`. Multi-pending semantics would force a design choice about which resolution drives the workflow status transition; serialised resolution is the simpler, audit-clearer shape and matches the "halt the workflow until the human decides" framing.
+
+Slice 5's new work is the checkpoint LOGIC + the CLI; actually pausing or resuming a *running* graph mid-execution remains the orchestrator's job (Phase 2). A workflow with an unresolved checkpoint reads as not-runnable — the orchestrator (when it lands) will call `is_workflow_paused_for_checkpoint` before scheduling each step and obey it. Slice 5 establishes the fact; the orchestrator obeys it later.
+
+CLI surface in `src/agent_habitat/cli.py`:
+
+  `agent-habitat checkpoint [--db PATH] list [--workflow ID]`
+  `agent-habitat checkpoint [--db PATH] show CHECKPOINT_ID`
+  `agent-habitat checkpoint [--db PATH] approve CHECKPOINT_ID --reviewer NAME [--note TEXT]`
+  `agent-habitat checkpoint [--db PATH] reject  CHECKPOINT_ID --reviewer NAME [--reason TEXT]`
+
+`--db` defaults to `DEFAULT_DB_PATH` (the production `data/state/agent_habitat.db`). `--reviewer` is required on approve/reject — every decision lands with a name on it for audit. `list` renders a per-checkpoint two-line block (id + workflow + action + requested-at + requester, then the summary). `show` renders a full detail card with the proposed payload pretty-printed as JSON; pending checkpoints include the project's decision-support footer ("operational context for your approval decision, not legal/medical/financial advice — verify before approving"). Resolved checkpoints render the resolution + reviewer + resolved_at + note. `CheckpointError` (unknown id, terminal workflow, already-resolved, already-pending) surfaces as a clean `click.ClickException` with a non-zero exit and no traceback noise.
+
+Audit shape on the events table — every checkpoint emits two or three rows total:
+- `checkpoint.requested` at level CHECKPOINT, payload `{event_type, action, summary, proposed_payload?, requested_by?}`.
+- `checkpoint.approved` OR `checkpoint.rejected` at level APPROVAL, payload `{event_type, checkpoint_id, reviewer, note?}`.
+
+This is the first time the CHECKPOINT and APPROVAL `EventLevel`s are written (Slice 4 added the taxonomy + level guide; Slice 5 is the first writer). The `EventType.CHECKPOINT_REQUESTED/APPROVED/REJECTED` members from Slice 4 are used verbatim — not redefined.
+
+Tests: 30 deterministic in `tests/test_checkpoint.py`. Six test classes plus one round-trip:
+- `TestRequest` — event-row shape, level, taxonomy; workflow → PAUSED; optional fields omitted when unset; unknown workflow / terminal workflow (parametrised over completed/failed/cancelled) / already-pending all raise.
+- `TestResolveApprove` — workflow PAUSED → RUNNING with `finished_at` unchanged; approval event back-references checkpoint id and records reviewer + note.
+- `TestResolveReject` — workflow PAUSED → CANCELLED with `finished_at` stamped; rejection event carries checkpoint_id + reason.
+- `TestQueries` — `list_pending_checkpoints` filters resolved out and supports workflow filtering; `is_workflow_paused_for_checkpoint` mirrors the pending flag across request/resolve; `get_checkpoint` returns None for unknown ids and ignores non-checkpoint event ids (defends against passing a `workflow.note` row id).
+- `TestResolveErrors` — approve/reject of unknown id raises; double-approve and approve-after-reject raise.
+- `TestCLI` (click.testing.CliRunner over a tmp_path DB):
+    - `list` empty + `list` with one pending
+    - `show` pending renders decision-support footer; `show` resolved renders the resolution block (no footer)
+    - `approve` + `reject` happy paths through the CLI, then re-open the DB and verify workflow status + resolution
+    - `show` unknown id, `approve` unknown id, `reject` already-resolved id all exit non-zero with the right message
+    - `approve` without `--reviewer` exits non-zero (click's own required-option enforcement)
+- `test_proposed_payload_json_roundtrip` — nested dicts + lists in `proposed_payload` survive emit_event → SQLite TEXT(json) → load_events → get_checkpoint.
+
+Full suite (149 tests including llm.py, state, budget, observability, checkpoint) passes. ruff check + ruff format --check + mypy strict all clean.
+
 Implemented `src/agent_habitat/observability/` — the ObservabilityLayer. Three files, deliberately proportionate:
 
 `events.py` — unified writer over the existing ADR-002 `events` table. `emit_event(conn, *, workflow_id, event_type, level, message, structured_data=None, step_id=None, timestamp=None)` always stamps `structured_data.event_type` as the first key (rejects caller-supplied `event_type` inside the payload to prevent two-source-of-truth bugs). `EventType` enum is the canonical taxonomy: workflow.{started,completed,failed,cancelled,note}, step.{started,completed,failed}, budget.exceeded (Slice 3 owns the writer, listed here for completeness), checkpoint.{requested,approved,rejected} (Slice 5), agent.fabrication_detected (Phase 2). `EVENT_LEVEL_GUIDE` documents INFO/WARN/ERROR/CHECKPOINT/APPROVAL semantics — the contract every future emitter inherits. `events_of_type()` is the generic `json_extract`-backed read primitive (same pattern Slice 3 uses in `is_workflow_halted_by_budget`).
@@ -75,4 +129,4 @@ Slice 3's actual new work (per the kickoff prompt) was the budget-check + halt-s
 Tests: 40 deterministic tests in `tests/test_budget.py` — pure evaluator across boundary/edge cases (zero cap, threshold=0, threshold=1, at-cap, at-threshold); UTC window correctness including tz conversion and naive-datetime defensive path; `cost_within_window` inclusion/exclusion at boundaries and isolation across workflows; end-to-end check with override resolution; exceed-event row shape; halt-signal query including the "unrelated error event must not trip the halt" anti-confusion case; TOML config loading including missing file, malformed TOML, missing required key, missing [defaults] section, override without `daily_cap_usd`, threshold out of range, and a sanity-check that the bundled `config/budgets.toml` loads. Full suite (90 tests including llm.py and state) passes cleanly. ruff check + ruff format + mypy strict all clean.
 
 ## Next Session Entry Point
-Fresh session, Opus high. **Phase 1 Slice 5 — CheckpointSystem.** Human-in-the-loop pause/resume primitive for flagged actions (sending outreach, publishing, irreversible state changes). LangGraph's native `interrupt`/`Command(resume=...)` is the runtime mechanism (ADR-001/ADR-002 already named this); Slice 5's job is the audit half — writing `checkpoint.requested` / `checkpoint.approved` / `checkpoint.rejected` events through `observability.emit_event` (taxonomy and level semantics already in place from Slice 4), the approval-decision payload contract, and the resume-on-approval primitive the Phase 2 orchestrator will call. The actual orchestrator wiring + a CLI approval surface remain Phase 2. Do not build a web UI (still deferred).
+Fresh session, Opus high. **Phase 1 Slice 6 — demo agent (URL summarizer).** First end-to-end workload riding the habitat: a single-agent workflow that fetches a URL via `httpx`, parses with `beautifulsoup4`, and summarises through `llm.py` (Haiku tier — pure grunt work, not Opus). The slice exercises every habitat primitive landed so far end-to-end: workflow + step rows via `state.persistence`, telemetry via `llm.py`, daily-budget check via `budget.check_workflow_budget` before each step, and (optionally) a `checkpoint.requested` before the workflow publishes its summary (proves the Slice 5 path under real load). Outputs a Markdown summary file; no orchestrator yet (Phase 2) — single-agent linear path is hand-wired in a thin script. Decision-support framing on the summary itself. Per CLAUDE.md tool discipline: `httpx` for fetch, `beautifulsoup4` for parsing; all LLM calls through `llm.py`. Budget cap for `url_summarizer` is already set to $2 in `config/budgets.toml`.

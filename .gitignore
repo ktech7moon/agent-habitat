@@ -12,3 +12,4 @@ data/logs/*.jsonl
 *.egg-info/
 build/
 dist/
+.claude/settings.local.json

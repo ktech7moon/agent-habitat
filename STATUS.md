@@ -4,7 +4,7 @@
 Phase 1 — Habitat Infrastructure (full plan: docs/ROADMAP.md)
 
 ## Current Slice
-Slice 2 — Persistence layer (Pydantic models + SQLite CRUD + reconciliation)  **— COMPLETE**
+Slice 3 — Budget caps (config + check + exceed-detection + halt signal)  **— COMPLETE**
 
 ## Slice 1 Subtasks
 - [x] Scaffold project skeleton + plan docs
@@ -22,23 +22,34 @@ Slice 2 — Persistence layer (Pydantic models + SQLite CRUD + reconciliation)  
 - [x] Orphan reconciliation: `reconcile_orphan_steps` (startup sweep per ADR-002)
 - [x] 33 deterministic tests in `tests/test_state.py`; full suite passes, ruff + mypy strict clean
 
+## Slice 3 Subtasks
+- [x] Budget config: `config/budgets.toml` (operator-tunable, stdlib `tomllib`, no new dep)
+- [x] `BudgetConfig` pydantic model + `load_budget_config()` with operator-debuggable errors
+- [x] `cap_for_workflow_type()` resolution: override wins, else default
+- [x] UTC calendar-day window helper (`utc_day_window`) — decision recorded under Open Questions
+- [x] `cost_within_window` — SUM over `workflow_steps.cost_usd` for steps with `started_at` in window
+- [x] Pure `evaluate_budget(cost, cap, threshold) → UNDER | APPROACHING | OVER`
+- [x] `check_workflow_budget()` — composed end-to-end check returning a `BudgetCheck` dataclass
+- [x] `record_budget_exceeded()` — writes a structured `budget.exceeded` event into the EXISTING `events` table (no ADR-002 schema change)
+- [x] `is_workflow_halted_by_budget()` — `json_extract`-backed halt-signal query for the Phase 2 orchestrator
+- [x] 40 deterministic tests in `tests/test_budget.py`; full suite (90 tests) passes, ruff + mypy strict clean
+
 ## Open Questions
-- **Rate table needs verification.** `_RATES_USD_PER_MTOK` in `llm.py` uses best-known values (Haiku $1/$5, Sonnet $3/$15, Opus $15/$75 per MTok input/output) stamped 2026-05-13. Joseph: cross-check against the public Anthropic pricing page before relying on the cost numbers for any budget decision (Slice 3 will).
+- **Rate table needs verification.** `_RATES_USD_PER_MTOK` in `llm.py` uses best-known values (Haiku $1/$5, Sonnet $3/$15, Opus $15/$75 per MTok input/output) stamped 2026-05-13. Joseph: cross-check against the public Anthropic pricing page before relying on the cost numbers for any budget decision (Slice 3 enforcement is now wired but reads the same rate table).
 - **ADR-002 underspecification: `workflows.id` generation algorithm.** ADR-002 fixes the *relationship* (id is shared with LangGraph as `thread_id`) and the *type* (TEXT PRIMARY KEY) but does not name a generation method. Slice 2 defaults to `uuid.uuid4().hex` via `new_workflow_id()`; callers may override. Revisit with an ADR-002 addendum if Phase 2 needs sortable or time-prefixed ids (ULID, snowflake) for cheap range scans.
 - **ADR-002 underspecification: orphan reconciliation target without LangGraph state.** ADR-002 says orphans reconcile to "failed with a synthesized event, or resume." The "or resume" branch needs LangGraph checkpoint state to decide whether resume is safe; that wiring lands with the Phase 2 orchestrator. Slice 2 implements the deterministic half: mark orphan FAILED, set `finished_at=now`, synthesize a WARN event. The resume branch can layer on top later without changing this contract.
+- **Slice 3 "daily" definition resolved: UTC calendar day.** "Daily budget cap" = the half-open interval `[today 00:00:00 UTC, tomorrow 00:00:00 UTC)`. Caps reset at UTC midnight. Why UTC over rolling-24h or local-tz: aligns with the JSONL telemetry directory layout (`data/logs/YYYY-MM-DD/` already UTC), is trivially auditable, and makes window queries simple ISO-string range comparisons. Revisit if a workload needs per-tenant local-tz semantics.
 
 ## Last Session
-Implemented `src/agent_habitat/state/` — `models.py` (Pydantic v2 models for `Workflow`, `WorkflowStep`, `Event` plus the three status/level enums and `new_workflow_id()`), `schema.py` (idempotent DDL exactly per ADR-002, plus a `connect()` helper that turns FKs on and sets `Row` factory), and `persistence.py` (the public CRUD surface listed above). All three audit tables are created against `data/state/agent_habitat.db` by default; tests use `tmp_path` only.
+Implemented `src/agent_habitat/budget/` — `config.py` (Pydantic v2 `BudgetConfig`, `load_budget_config()` over stdlib `tomllib`, `cap_for_workflow_type()`, and a `BudgetConfigError` with path-named messages) and `tracker.py` (`utc_day_window`, `cost_within_window`, pure `evaluate_budget`, `check_workflow_budget`, `record_budget_exceeded`, `is_workflow_halted_by_budget`, plus `BudgetCheck` dataclass and `BudgetStatus` enum). Bundled `config/budgets.toml` ships default daily cap = $5.00 with `approaching_threshold = 0.80`, and overrides for `lead_enrichment` ($10) and `url_summarizer` ($2). No new dependency — Python 3.11+ `tomllib`.
 
-Aggregation primitive: `recompute_cost_total(conn, workflow_id)` reads `SUM(workflow_steps.cost_usd)` and writes it back to `workflows.cost_total_usd`. Per ADR-002, Slice 2 does aggregation; the budget cap + halt-on-exceed is Slice 3.
+Halt-signal representation: an ERROR-level row in the EXISTING `events` table with `structured_data` carrying `{event_type: "budget.exceeded", workflow_type, cost_usd, cap_usd, window_start, window_end}`. The halt query uses SQLite's built-in `json_extract` against `$.event_type`. No ADR-002 schema change was required — the events table's structured_data column was designed for exactly this kind of additive use.
 
-Reconciliation: `reconcile_orphan_steps(conn, now=None)` is the startup sweep ADR-002 named. It finds `workflow_steps WHERE status='running' AND finished_at IS NULL`, marks each one FAILED with a synthesized `events` row at level=WARN carrying `step_id` / `step_index` / `agent_name` / `reconciled_at` in `structured_data`. Idempotent (re-running on a swept DB is a no-op). Wiring it to actual startup is deferred until the orchestrator exists.
+Cost attribution by `workflow_steps.started_at` (the day the step *began* is the day its cost counts). ISO-8601 UTC strings sort correctly as text, so the window query is a direct string range scan — no datetime coercion. Boundaries are inclusive lower / exclusive upper (`>= start AND < end`).
 
-Step 0 (separate commit `4f9967c`): added `stop_reason: str | None` to `LLMResult` (pass-through from Anthropic's `Message.stop_reason`) and a derived `truncated` computed property (`stop_reason == "max_tokens"`). Also written to the JSONL telemetry record. Four new unit tests around the field.
+Slice 3's actual new work (per the kickoff prompt) was the budget-check + halt-signal LOGIC; actually stopping a running workflow is the orchestrator's job in Phase 2 and not built here. `is_workflow_halted_by_budget` is the primitive the orchestrator will call before scheduling each step.
 
-Tests: 33 deterministic tests in `tests/test_state.py` covering idempotent DDL, FK enforcement, CRUD round-trip (Pydantic structural equality), status query, step-index uniqueness, ordered loads, JSON column round-trip (including unicode + nested + None), cost rollup (sum, zero-steps, isolation across workflows), full-round-trip with workflow + steps + events, and reconciliation (orphan → failed + event, completed/failed not touched, weird "running with finished_at" left alone, idempotent re-run, multi-workflow sweep). Full suite (49 tests including llm.py) passes cleanly. ruff check + ruff format + mypy strict all clean.
-
-Two ADR-002 underspecifications were resolved with documented defaults (see Open Questions): id generation = `uuid4().hex`; orphan resolution = always FAILED for now, since LangGraph state for the "or resume" branch doesn't exist yet.
+Tests: 40 deterministic tests in `tests/test_budget.py` — pure evaluator across boundary/edge cases (zero cap, threshold=0, threshold=1, at-cap, at-threshold); UTC window correctness including tz conversion and naive-datetime defensive path; `cost_within_window` inclusion/exclusion at boundaries and isolation across workflows; end-to-end check with override resolution; exceed-event row shape; halt-signal query including the "unrelated error event must not trip the halt" anti-confusion case; TOML config loading including missing file, malformed TOML, missing required key, missing [defaults] section, override without `daily_cap_usd`, threshold out of range, and a sanity-check that the bundled `config/budgets.toml` loads. Full suite (90 tests including llm.py and state) passes cleanly. ruff check + ruff format + mypy strict all clean.
 
 ## Next Session Entry Point
-Fresh session, Opus high. **Phase 1 Slice 3 — cost tracking module + budget caps.** Build on top of Slice 2's `recompute_cost_total`: a `CostTracker` (or equivalent) that observes per-call `LLMResult.cost_usd`, persists incrementally via `workflow_steps.cost_usd` + `recompute_cost_total`, and enforces a per-workflow cap (and optionally a daily aggregate cap) by raising before the next LLM call when the budget would be exceeded. Tests must cover the halt-on-exceed semantics deterministically (no live API). Verify the rate table in `llm.py:_RATES_USD_PER_MTOK` against the public Anthropic pricing page before any budget logic ships.
+Fresh session, Opus high. **Phase 1 Slice 4 — ObservabilityLayer.** Cross-cutting telemetry beyond the per-call JSONL that `llm.py` already writes: structured event emission helpers, cost/latency rollup queries, and CLI-friendly inspection commands so the operator can answer "what did this workflow do, when, and how much did it cost" without writing SQL by hand. Slice 4 should also surface budget status (UNDER / APPROACHING / OVER) and the halt-signal event in whatever inspection surface emerges. Do not touch the orchestrator (Phase 2) or add a web UI (still deferred).

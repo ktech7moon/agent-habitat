@@ -1,0 +1,42 @@
+# agent-habitat — per-workflow daily spend caps.
+#
+# This file is the operator's tuning surface (CLAUDE.md: "operator tunes
+# outcomes, developers tune prompts"). Edit values here to change spend
+# limits without touching code or schema.
+#
+# Window semantics
+# ----------------
+# "Daily" means UTC calendar day: the half-open interval
+# [today 00:00:00 UTC, tomorrow 00:00:00 UTC). Caps reset at UTC midnight.
+# Why UTC: the JSONL telemetry directory layout (data/logs/YYYY-MM-DD/) is
+# already UTC, so attribution lines up cleanly between budget enforcement
+# and audit logs. Rolling 24h was considered and rejected — calendar-day
+# is simpler to reason about and easier for operators to audit.
+#
+# Cost attribution
+# ----------------
+# A workflow's "spend today" is the sum of workflow_steps.cost_usd for
+# steps whose started_at falls inside today's UTC window. Caps are
+# evaluated per workflow_id, not aggregate-by-type.
+#
+# Resolution
+# ----------
+# Cap for a workflow is resolved by workflow_type: an explicit entry in
+# [workflow_types.<name>] wins, otherwise [defaults] applies.
+
+[defaults]
+# Daily spend cap, in USD, for any workflow_type without an explicit override.
+daily_cap_usd = 5.00
+
+# Fraction of cap that flips status from UNDER to APPROACHING (0.0–1.0).
+# At cost >= cap * approaching_threshold and cost < cap, status is APPROACHING.
+# At cost >= cap, status is OVER and a halt-signal event is recorded.
+approaching_threshold = 0.80
+
+# Per-workflow-type overrides. Add a section per workflow_type to set a
+# different cap. Threshold is global (lives under [defaults]).
+[workflow_types.url_summarizer]
+daily_cap_usd = 2.00
+
+[workflow_types.lead_enrichment]
+daily_cap_usd = 10.00

@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Edit", "Write", "Read",
+      "Bash(python:*)", "Bash(python3:*)", "Bash(python3.11:*)",
+      "Bash(pip:*)", "Bash(pip3:*)",
+      "Bash(pytest:*)", "Bash(ruff:*)", "Bash(mypy:*)",
+      "Bash(make:*)",
+      "Bash(agent-habitat:*)",
+      "Bash(.venv/bin/*:*)",
+      "Bash(ls:*)", "Bash(cat:*)", "Bash(head:*)",
+      "Bash(tail:*)", "Bash(wc:*)", "Bash(find:*)",
+      "Bash(grep:*)", "Bash(rg:*)",
+      "Bash(mkdir:*)", "Bash(touch:*)", "Bash(mv:*)",
+      "Bash(cp:*)", "Bash(echo:*)", "Bash(which:*)",
+      "Bash(pwd)",
+      "Bash(git status)", "Bash(git status:*)",
+      "Bash(git diff:*)", "Bash(git log:*)",
+      "Bash(git show:*)", "Bash(git add:*)",
+      "Bash(git commit:*)", "Bash(git branch:*)",
+      "Bash(git checkout:*)", "Bash(git stash:*)",
+      "Bash(git restore:*)", "Bash(git rm:*)",
+      "Bash(git mv:*)",
+      "Bash(git init)", "Bash(git init:*)"
+    ],
+    "deny": [
+      "Bash(rm:*)", "Bash(git push:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(git clean:*)", "Bash(git branch -D:*)",
+      "Bash(git branch -d:*)",
+      "Bash(git checkout --force:*)",
+      "Bash(git checkout -f:*)"
+    ]
+  }
+}

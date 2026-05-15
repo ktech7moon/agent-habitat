@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-habitat"
+version = "0.0.1"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic",
+    "langgraph",
+    "langchain-core",
+    "langchain-anthropic",
+    "pydantic>=2",
+    "click",
+    "structlog",
+    "python-dotenv",
+    "httpx",
+    "beautifulsoup4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-cov", "ruff", "mypy"]
+
+[project.scripts]
+agent-habitat = "agent_habitat.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

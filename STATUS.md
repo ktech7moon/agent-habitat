@@ -4,7 +4,7 @@
 Phase 1 — Habitat Infrastructure (full plan: docs/ROADMAP.md)
 
 ## Current Slice
-Slice 6 — Demo agent: URL summarizer exercising the full habitat stack **— COMPLETE**
+Slice 7 — Multi-URL live calibration + Phase 1 README **— COMPLETE**. Phase 1 shippable.
 
 ## Slice 1 Subtasks
 - [x] Scaffold project skeleton + plan docs
@@ -41,6 +41,33 @@ Slice 6 — Demo agent: URL summarizer exercising the full habitat stack **— C
 - [x] `record_budget_exceeded()` — writes a structured `budget.exceeded` event into the EXISTING `events` table (no ADR-002 schema change)
 - [x] `is_workflow_halted_by_budget()` — `json_extract`-backed halt-signal query for the Phase 2 orchestrator
 - [x] 40 deterministic tests in `tests/test_budget.py`; full suite (90 tests) passes, ruff + mypy strict clean
+
+## Slice 7 Subtasks
+- [x] Live API smoke across 5 deliberately varied URLs (Wikipedia article w/ `<main>`, Python docs w/o semantic tags, PEP 20 w/ `<article>`, example.com sparse, httpbin 404 controlled failure)
+- [x] Per-run dataset captured from persisted workflow + JSONL telemetry: status, cost USD, input/output tokens, wall-time per step, parse path, output_ref
+- [x] Synthesis: cost-distribution analysis, fixed-floor confirmation, MAX_PROMPT_CHARS truncation discovery, parse-path coverage of all three branches, budget-cap calibration
+- [x] Phase 1 README rewritten: hiring-manager-honest framing, real-numbers calibration table, what-the-live-runs-taught-us section, honest scope (what Phase 1 is NOT), verified setup/run commands
+- [x] Full suite (174 deterministic) passes; ruff check + ruff format + mypy strict all clean
+
+## Slice 7 Calibration Findings
+
+Five live runs on 2026-05-14 with `claude-sonnet-4-6`. Full dataset is in README.md
+("Live calibration" section); the findings that came out of it:
+
+- **Cost spans 14× across page types** ($0.001212 → $0.016830). The fixed-cost-floor pattern (Slice 6 finding on example.com) holds and is now quantified at ~$0.0012 per minimal run. Above ~500 input tokens, cost is input-dominated; output tokens are bounded 60–238 by the "three to five sentences" instruction regardless of input size.
+- **`MAX_PROMPT_CHARS=12_000` fires silently on heavy real-world pages.** Wikipedia (45,079 extracted chars) and Python docs (26,239 extracted chars) both got truncated to the first 12K before reaching the LLM. Slice 6's single trivial page (142 chars) could not have surfaced this. Recorded in README as an honest product behavior; queued below as an Open Question for Phase 2 (log a `WARN` event on truncation, or chunk-and-stitch — ADR-gated).
+- **All three parse-strategy branches got real-world coverage.** `<main>` (Wikipedia), `<article>` (PEP 20 — first observation; Slice 6 only saw fallback), whole-soup fallback (Python docs + example.com). The fallback is load-bearing on the public web: Python's official docs use neither semantic tag.
+- **Latency is LLM-bound at 92–94%** of wall time on completed runs. Fetch + parse total 0.2–0.5s; everything else is Sonnet. Wall time scales at ~1.5s per 1,000 input tokens. Implication for Phase 2: each agent in a five-agent chain adds 2–7s LLM wall time depending on payload — pipelining and Haiku-for-grunt-work matter for end-to-end latency, not just dollars.
+- **example.com run-to-run variance is tight.** Slice 6: 104 in / 54 out / $0.001122. Slice 7: 104 in / 60 out / $0.001212. Input deterministic, output ±10%. Telemetry numbers are trustworthy signal, not noise.
+- **Failure contract held in the wild.** The httpbin 404 produced exactly the expected four-event trail (`workflow.started`, `step.started`, `step.failed`, `workflow.failed`), `FAILED` workflow + step rows with `finished_at` stamped, fast exit (0.52s), zero LLM cost. No stuck-RUNNING workflow.
+
+**Budget cap recommendation — KEEP $2/day for `url_summarizer`.** Most expensive observed
+run was $0.01683 (Python docs); $2/day = ~118 max-cost runs/day, or ~218 at the
+mean of the four successful runs ($0.009187). The cap is now calibrated against
+real heavy-page cost rather than extrapolated from the trivial-page floor —
+generous headroom for operator-paced exploration without being so loose it
+provides no safety signal. No config change needed; `config/budgets.toml` stays
+at $2.00 daily for the `url_summarizer` override.
 
 ## Slice 6 Subtasks
 - [x] `src/agent_habitat/agents/summarizer.py` — `run_summarizer`, `fetch_url`, `extract_readable_text`, `SummarizerResult`, `SummarizerError`; three synchronous steps (fetch / parse / summarize), Sonnet tier via `llm.complete()`, decision-support framing in the CLI output
@@ -79,9 +106,38 @@ Slice 7 calibration story / README:
 - **ADR-002 underspecification: `workflows.id` generation algorithm.** ADR-002 fixes the *relationship* (id is shared with LangGraph as `thread_id`) and the *type* (TEXT PRIMARY KEY) but does not name a generation method. Slice 2 defaults to `uuid.uuid4().hex` via `new_workflow_id()`; callers may override. Revisit with an ADR-002 addendum if Phase 2 needs sortable or time-prefixed ids (ULID, snowflake) for cheap range scans.
 - **ADR-002 underspecification: orphan reconciliation target without LangGraph state.** ADR-002 says orphans reconcile to "failed with a synthesized event, or resume." The "or resume" branch needs LangGraph checkpoint state to decide whether resume is safe; that wiring lands with the Phase 2 orchestrator. Slice 2 implements the deterministic half: mark orphan FAILED, set `finished_at=now`, synthesize a WARN event. The resume branch can layer on top later without changing this contract.
 - **Slice 3 "daily" definition resolved: UTC calendar day.** "Daily budget cap" = the half-open interval `[today 00:00:00 UTC, tomorrow 00:00:00 UTC)`. Caps reset at UTC midnight. Why UTC over rolling-24h or local-tz: aligns with the JSONL telemetry directory layout (`data/logs/YYYY-MM-DD/` already UTC), is trivially auditable, and makes window queries simple ISO-string range comparisons. Revisit if a workload needs per-tenant local-tz semantics.
+- **Surface `MAX_PROMPT_CHARS` truncation in the audit trail (ADR-gated).** The Slice 7 live sweep proved the 12,000-char prompt cap fires silently on heavy real-world pages (Wikipedia 45K extracted chars → 12K sent; Python docs 26K → 12K). Today there is no event row, no log line, no step metadata recording that the LLM saw a truncated view. Two reasonable resolutions: (a) emit a `step.note` event at level WARN when `len(readable_text) > MAX_PROMPT_CHARS` carrying `{extracted_chars, sent_chars, truncated: true}`; (b) chunk-and-stitch (summarise sections, then summarise the summaries) — bigger product change, ADR-worthy. Neither is the Slice 7 fix; this is a Phase 2 (or Slice 8 polish) decision. Source: Slice 7 live calibration finding #1, recorded in README.
 - **Promote a habitat-level `run_step()` utility before Phase 2 agents are built (ADR-gated).** The URL summarizer's step-lifecycle code (`_run_step` / `_run_summarize_step` in `src/agent_habitat/agents/summarizer.py` — ~188 lines) implements the open-RUNNING-row → emit step.started → do work → close COMPLETED/FAILED → emit result-event sequence. Every Phase 2 agent (researcher, extractor, scorer, drafter, critic) needs this exact lifecycle. If each copies it, that is ~940 lines of duplicated boilerplate and five independent copies of the audit-grade guarantee that can drift. The fix is to promote a habitat-level `run_step()` utility that agents call instead of reimplementing — a new shared abstraction, so it is ADR-gated per Working Agreement rule 14. Decide it as part of (or alongside) the Phase 2 Slice 1 ADR, before Phase 2 agents are built. Source: the Slice 6 summarizer.py audit. A separate, smaller cleanup also rides along whenever `summarizer.py` is next rewritten: ~40-45 lines of cosmetic trim (over-long module docstring, five section dividers, WORKFLOW_TYPE/AGENT_NAME constants that could be literals) — not worth its own session, fold it into the `run_step` extraction diff.
 
 ## Last Session
+Slice 7 — multi-URL live calibration + Phase 1 README. Ran the URL summarizer
+against five deliberately varied real URLs (Wikipedia article with `<main>`,
+Python docs with no semantic tags, PEP 20 with `<article>`, sparse example.com,
+controlled httpbin 404), captured a clean per-run dataset from the persisted
+workflow + JSONL telemetry, synthesised findings, and rewrote `README.md` as a
+hiring-manager-facing Phase 1 showcase grounded in those real numbers — full
+dataset table + the calibration-story section (what live runs taught us that
+mocks couldn't). No product code changed; all quality gates rerun clean (174
+deterministic tests, ruff check, ruff format, mypy strict). Total live-API
+spend for the sweep: ~$0.037 across five runs.
+
+Key calibration outcomes: (1) cost spans 14× across page types and is
+input-dominated above ~500 tokens — fixed-cost floor pattern from Slice 6
+holds and is now quantified at ~$0.0012/run; (2) `MAX_PROMPT_CHARS=12_000`
+truncation fires silently on heavy real-world pages (Wikipedia, Python docs)
+— recorded as a new Open Question; (3) all three parse-strategy branches got
+real coverage including the previously-unseen `<article>` branch; (4) latency
+is LLM-bound at 92–94% of wall time; (5) example.com run-to-run variance is
+tight (input deterministic, output ±10%); (6) failure contract held in the
+wild on the 404; (7) budget cap of $2/day for `url_summarizer` is recommended
+to STAY — now calibrated against real heavy-page cost ($0.01683 max) rather
+than extrapolated from the trivial-page floor.
+
+Phase 1 is shippable. Five subsystems (LLM wrapper, state, observability,
+budget, checkpoint) each independently exercised by tests and live runs; one
+demo agent threads them end-to-end; the audit chain `workflow → step →
+telemetry record` resolves on every successful run; the failure path holds.
+
 Implemented `src/agent_habitat/agents/summarizer.py` — the Slice 6 demo agent. Three synchronous steps (fetch / parse / summarize) hand-wired through the existing habitat: workflow + step rows via Slice 2's persistence, lifecycle and step events via Slice 4's `emit_event` over the canonical `EventType` taxonomy, the LLM call routed through `llm.py` (Sonnet tier — the kickoff prompt overrode STATUS.md's earlier "Haiku" note), and `recompute_cost_total` rolling the summarize step's real cost up onto `workflows.cost_total_usd`. The summarize step's `output_ref` points at the JSONL line `llm.py` wrote, so the audit chain `workflow → step → telemetry record` resolves end-to-end on the first real workload.
 
 Failure-path contract: any step error transitions the workflow to `FAILED` with `finished_at` stamped, emits a `step.failed` + `workflow.failed` pair, and returns a `SummarizerResult(status=FAILED, error_step, error_message)`. The agent never crashes uncaught from the caller's perspective, never leaves a workflow stuck in `RUNNING`. Exercised in tests across four real failure modes (bad URL scheme, 404, httpx network error, empty/SPA page) plus an injected LLM error — each one verifies the workflow row, the step row, and the event sequence.
@@ -163,4 +219,25 @@ Slice 3's actual new work (per the kickoff prompt) was the budget-check + halt-s
 Tests: 40 deterministic tests in `tests/test_budget.py` — pure evaluator across boundary/edge cases (zero cap, threshold=0, threshold=1, at-cap, at-threshold); UTC window correctness including tz conversion and naive-datetime defensive path; `cost_within_window` inclusion/exclusion at boundaries and isolation across workflows; end-to-end check with override resolution; exceed-event row shape; halt-signal query including the "unrelated error event must not trip the halt" anti-confusion case; TOML config loading including missing file, malformed TOML, missing required key, missing [defaults] section, override without `daily_cap_usd`, threshold out of range, and a sanity-check that the bundled `config/budgets.toml` loads. Full suite (90 tests including llm.py and state) passes cleanly. ruff check + ruff format + mypy strict all clean.
 
 ## Next Session Entry Point
-Fresh session, Opus high. **Phase 1 Slice 7 — live API smoke across 3-5 URLs + Phase 1 README.** Slice 6 landed one live calibration data point (example.com); Slice 7 broadens it: pick 3-5 stable, varied URLs (a news article with semantic `<article>` markup, a long-form blog post, a corporate marketing page, a docs page, optionally one paywall/SPA to confirm the FAILED path) and run `run-summarizer` against each, capturing real input-token / output-token / cost / latency numbers per page-type. Roll the calibration table into a `README.md` for Phase 1 — the operator-facing pitch ("habitat infrastructure for production agents") plus the calibration story (what the live runs revealed that mocks couldn't, what's surprisingly cheap, where the `<main>` preference fires vs. falls back). Audit the Phase 1 surface for any rough edges the multi-URL run exposes. No new code unless a calibration finding demands it. After Slice 7: Phase 1 is shippable; Phase 2 begins.
+Phase 1 is shippable. Joseph's call between two next-session options:
+
+**Option A — Slice 8 (optional Phase 1 polish).** Fresh session, Sonnet medium.
+Add the Mermaid architecture diagram, hiring-manager pass on the README (tone +
+density tightening), anonymous-friendly contact section, decide on the
+truncation-event Open Question (warning event vs ADR for chunk-and-stitch — the
+warning event is small and worth doing as part of polish; chunk-and-stitch is
+its own ADR and belongs to Phase 2 if at all). Light-code session.
+
+**Option B — Phase 2 Slice 1 (crew architecture ADR).** Fresh session, Opus
+xHigh. The ADR-gated decisions before any Phase 2 agent code: (1) which five
+agents, what handoffs (sequential vs parallel), shared-state shape, error/retry
+strategy; (2) whether to promote a habitat-level `run_step()` utility now
+(Open Question above — recommended bundled with this ADR, since every Phase 2
+agent needs the lifecycle); (3) ADR-003 web-search-tool choice for the
+researcher (Anthropic `web_search` tool vs Tavily vs Brave vs custom — decide
+before Slice 2). No Phase 2 implementation in this session; ADRs only,
+alternatives mandatory.
+
+Recommendation: **Option B**. The README is honest as-is, and the polish-pass
+quality bar makes more sense after Phase 2 lands real numbers from a non-toy
+workload. The Phase 2 Slice 1 ADR is the bigger blocker.

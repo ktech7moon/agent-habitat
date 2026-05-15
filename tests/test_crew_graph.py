@@ -586,15 +586,17 @@ class TestRunCrewApproved:
         wf = load_workflow(conn, "wf-crew-approve")
         assert wf is not None
         assert wf.status is WorkflowStatus.COMPLETED
-        # All four step rows present.
+        # All five step rows present (Slice 7 added the critic).
         steps = sorted(load_steps(conn, "wf-crew-approve"), key=lambda s: s.step_index)
         assert [s.agent_name for s in steps] == [
             "researcher",
             "extractor",
             "scorer",
             "drafter",
+            "critic",
         ]
-        assert steps[-1].step_index == STEP_INDEX_DRAFTER
+        # Drafter is step 4; critic is the new terminal step on a passed run.
+        assert any(s.step_index == STEP_INDEX_DRAFTER and s.agent_name == "drafter" for s in steps)
         # Resume idempotency: exactly one CHECKPOINT_REQUESTED row for this
         # workflow's approve_drafter action (the short-circuit prevented
         # a second `request_checkpoint` call on resume re-entry).

@@ -21,11 +21,13 @@ import click
 
 from agent_habitat import __version__
 from agent_habitat.agents import (
+    CriticResult,
     DrafterResult,
     ExtractorResult,
     ResearcherResult,
     ScorerResult,
     SummarizerResult,
+    run_critic,
     run_drafter,
     run_extractor,
     run_researcher,
@@ -686,6 +688,179 @@ def cmd_run_drafter(
         click.echo(_format_drafter_result(drafter_result, scorer_result))
         if drafter_result.status is WorkflowStatus.FAILED:
             raise click.exceptions.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 Slice 7: the standalone Critic CLI.
+# ---------------------------------------------------------------------------
+
+
+CRITIC_DECISION_FOOTER = (
+    "Automated fabrication-resistance critic. Each claim was walked down "
+    "the five-hop substring chain (Draft.prose → DimensionScore.grounded_quote "
+    "→ ProfileField.source_spans[].quote → Signal.text → Citation by Researcher "
+    "construction). Failures are mechanical, not LLM-judged; the Mode-2 Haiku "
+    "call only attaches an explanation + 'fixable_paraphrase'/'fabricated' "
+    "classification. Treat as decision support — a passed critique does not "
+    "validate factual accuracy beyond the substring chain."
+)
+
+
+@main.command("run-critic")
+@click.argument("company_name")
+@click.option(
+    "--db",
+    "db_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=DEFAULT_DB_PATH,
+    show_default=True,
+    help="Path to the agent-habitat SQLite file.",
+)
+@click.option(
+    "--rubric",
+    "rubric_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=DEFAULT_RUBRIC_PATH,
+    show_default=True,
+    help="Path to the ICP rubric TOML file (operator-tunable).",
+)
+@click.option(
+    "--max-searches",
+    default=3,
+    show_default=True,
+    type=int,
+    help="Researcher's web_search cap (forwarded to run-researcher).",
+)
+def cmd_run_critic(
+    company_name: str,
+    db_path: Path,
+    rubric_path: Path,
+    max_searches: int,
+) -> None:
+    """Run the full five-agent chain (researcher → extractor → scorer → drafter → critic).
+
+    Slice 7 standalone CLI — sequences five separate workflows, then walks
+    the Drafter's output through the substring-grounding chain. A gated
+    ScoredCompany skips drafter+critic (no draft, no critic). A failing
+    critique is shown but does NOT trigger the bounded retry — retry lives
+    only on the orchestrator (`run-crew`), where LangGraph state is held.
+    Use `run-crew` for the full retry-enabled flow.
+    """
+    try:
+        rubric = load_rubric(rubric_path)
+    except RubricConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    conn = init_db(db_path)
+    drafter_result: DrafterResult | None = None
+    critic_result: CriticResult | None = None
+    try:
+        researcher_result = run_researcher(
+            conn,
+            company_name=company_name,
+            max_searches=max_searches,
+        )
+        if researcher_result.status is WorkflowStatus.FAILED:
+            click.echo(_format_researcher_result(researcher_result))
+            raise click.exceptions.Exit(code=1)
+
+        extractor_result = run_extractor(conn, raw_signals=researcher_result.raw_signals)
+        if extractor_result.status is WorkflowStatus.FAILED:
+            click.echo(_format_researcher_result(researcher_result))
+            click.echo("")
+            click.echo("=" * 60)
+            click.echo("")
+            click.echo(_format_extractor_result(extractor_result))
+            raise click.exceptions.Exit(code=1)
+
+        scorer_result = run_scorer(conn, profile=extractor_result.profile, rubric=rubric)
+        if scorer_result.status is WorkflowStatus.FAILED:
+            click.echo(_format_researcher_result(researcher_result))
+            click.echo("")
+            click.echo("=" * 60)
+            click.echo("")
+            click.echo(_format_extractor_result(extractor_result))
+            click.echo("")
+            click.echo("=" * 60)
+            click.echo("")
+            click.echo(_format_scorer_result(scorer_result))
+            raise click.exceptions.Exit(code=1)
+
+        if scorer_result.scored_company.routes_to_draft:
+            drafter_result = run_drafter(conn, scored_company=scorer_result.scored_company)
+            if (
+                drafter_result.status is WorkflowStatus.COMPLETED
+                and drafter_result.draft is not None
+            ):
+                critic_result = run_critic(
+                    conn,
+                    draft=drafter_result.draft,
+                    scored_company=scorer_result.scored_company,
+                    profile=extractor_result.profile,
+                    raw_signals=researcher_result.raw_signals,
+                )
+    finally:
+        conn.close()
+
+    click.echo(_format_researcher_result(researcher_result))
+    click.echo("")
+    click.echo("=" * 60)
+    click.echo("")
+    click.echo(_format_extractor_result(extractor_result))
+    click.echo("")
+    click.echo("=" * 60)
+    click.echo("")
+    click.echo(_format_scorer_result(scorer_result))
+    click.echo("")
+    click.echo("=" * 60)
+    click.echo("")
+    if drafter_result is None:
+        click.echo(_format_no_draft(scorer_result))
+        return
+    click.echo(_format_drafter_result(drafter_result, scorer_result))
+    if drafter_result.status is WorkflowStatus.FAILED:
+        raise click.exceptions.Exit(code=1)
+    click.echo("")
+    click.echo("=" * 60)
+    click.echo("")
+    if critic_result is None:
+        click.echo("CRITIC: not run (drafter produced no draft).")
+    else:
+        click.echo(_format_critic_result(critic_result))
+        if critic_result.status is WorkflowStatus.FAILED:
+            raise click.exceptions.Exit(code=1)
+
+
+def _format_critic_result(result: CriticResult) -> str:
+    """Render the Critic's outcome for the CLI."""
+    lines: list[str] = [
+        f"CRITIC — workflow {result.workflow_id}",
+        f"  status: {result.status.value.upper()}",
+        f"  cost_usd: ${result.cost_usd:.6f}",
+    ]
+    if result.critique is None:
+        lines.append("  critique: (none — critic infrastructure failure)")
+        if result.error_message:
+            lines.append(f"  error: {result.error_message}")
+        return "\n".join(lines)
+    c = result.critique
+    lines.append(f"  passed: {c.passed}")
+    lines.append(f"  claim_count: {c.claim_count}")
+    lines.append(f"  failure_count: {c.failure_count}")
+    if not c.passed:
+        lines.append(f"  all_fabricated: {c.all_fabricated}")
+        lines.append("  failures:")
+        for i, v in enumerate(c.verdicts):
+            if v.passed:
+                continue
+            lines.append(f"    [{i}] failed_hop={v.failed_hop} classification={v.classification}")
+            lines.append(f'         claim_text: "{v.claim_text}"')
+            if v.upstream_quote is not None:
+                lines.append(f'         upstream:   "{v.upstream_quote}"')
+            lines.append(f"         explanation: {v.explanation}")
+    lines.append("")
+    lines.append(CRITIC_DECISION_FOOTER)
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

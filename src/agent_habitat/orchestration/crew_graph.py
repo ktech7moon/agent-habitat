@@ -1,9 +1,9 @@
-"""LangGraph orchestrator for the Phase 2 lead-enrichment crew — Slice 6.
+"""LangGraph orchestrator for the Phase 2 lead-enrichment crew — Slice 6 + Slice 7.
 
-Wires the four existing Layer A node functions (`researcher_node`,
-`extractor_node`, `scorer_node`, `drafter_node`) into one LangGraph
+Wires the five Layer A node functions (`researcher_node`, `extractor_node`,
+`scorer_node`, `drafter_node`, `critic_node`) into one LangGraph
 `StateGraph(CrewState)` with SQLite-backed checkpointing. The crew shape
-follows ADR-006 §1 minus the Slice-7 critic:
+follows ADR-006 §1 including Slice 7's bounded-retry edge:
 
     START → researcher → extractor → scorer → ROUTE ─┐
                                                       ├─ if gated  → terminate_no_draft → END
@@ -11,8 +11,24 @@ follows ADR-006 §1 minus the Slice-7 critic:
                                                       └─ if passed → request_drafter_approval (interrupt)
                                                                          │
                                                                          ROUTE ─┐
-                                                                                ├─ approved → drafter → END
+                                                                                ├─ approved → drafter → critic → ROUTE ─┐
+                                                                                │                                       ├─ passed → END
+                                                                                │                                       │
+                                                                                │                                       ├─ failed + retries==0 → drafter (retry) → critic → ROUTE
+                                                                                │                                       │
+                                                                                │                                       └─ failed + retries>=1 → terminate_with_critic_failure → END
+                                                                                │
                                                                                 └─ rejected → terminate_no_draft → END
+
+Slice 7 contract (ADR-006 §1 + §3 — bounded fabrication retry):
+  - The Critic node walks the five-hop substring chain for every DraftClaim.
+  - First failure: `fabrication_retries` is incremented and the graph routes
+    back to the drafter with `state["critique"]` attached; the drafter adapter
+    passes the prior Critique as the Drafter's `prior_critique` kwarg.
+  - Second failure: workflow finalises FAILED with `terminate_reason =
+    "critic_failure"`; the `agent.fabrication_detected` ERROR-level event is
+    emitted via `run_critic`'s shared emission path. ADR-006 §1 specifies
+    persistent fabrication is halt-worthy, not a benign empty-outcome.
 
 PERSISTENCE OWNERSHIP (Slice 6 STOP #2 — Option A).
 
@@ -71,6 +87,12 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command, interrupt
 
+from ..agents.critic import (
+    AGENT_NAME as CRITIC_AGENT_NAME,
+)
+from ..agents.critic import (
+    critic_node,
+)
 from ..agents.drafter import (
     AGENT_NAME as DRAFTER_AGENT_NAME,
 )
@@ -85,6 +107,7 @@ from ..agents.extractor import (
 )
 from ..agents.models import (
     CompanyProfile,
+    Critique,
     Draft,
     RawSignals,
     ScoredCompany,
@@ -124,6 +147,7 @@ from ..state.persistence import (
 )
 from .crew_state import (
     TERMINATE_REASON_COVERAGE_GATED,
+    TERMINATE_REASON_CRITIC_FAILURE,
     TERMINATE_REASON_REJECTED,
     TERMINATE_REASON_SCORE_GATED,
     CrewState,
@@ -146,13 +170,18 @@ WORKFLOW_TYPE = "lead_enrichment_crew"
 CHECKPOINT_ACTION_APPROVE_DRAFTER = "approve_drafter"
 
 
-# Step indices for the four agent adapters. Hard-coded (and contiguous) per the
+# Step indices for the agent adapters. Hard-coded (and contiguous) per the
 # linear topology — ADR-002's `UNIQUE (workflow_id, step_index)` constraint is
-# the only requirement; contiguity is convention.
+# the only requirement; contiguity is convention. Slice 7 reserves indices
+# 6/7 for the bounded-retry drafter+critic pair so a retried workflow still
+# satisfies the UNIQUE constraint with one row per (initial, retry) attempt.
 STEP_INDEX_RESEARCHER = 1
 STEP_INDEX_EXTRACTOR = 2
 STEP_INDEX_SCORER = 3
 STEP_INDEX_DRAFTER = 4
+STEP_INDEX_CRITIC = 5
+STEP_INDEX_DRAFTER_RETRY = 6
+STEP_INDEX_CRITIC_RETRY = 7
 
 
 @dataclass(frozen=True)
@@ -185,6 +214,8 @@ class CrewResult:
     profile: CompanyProfile | None = None
     scored_company: ScoredCompany | None = None
     draft: Draft | None = None
+    critique: Critique | None = None
+    fabrication_retries: int = 0
     terminate_reason: str | None = None
     pending_checkpoint_id: int | None = None
     cost_usd: float = 0.0
@@ -291,10 +322,13 @@ def build_crew_graph(
     def _drafter_adapter(state: CrewState) -> dict[str, Any]:
         wf_id = state["workflow_id"]
         scored_company = state["scored_company"]
+        retries = state.get("fabrication_retries", 0)
+        prior_critique = state.get("critique") if retries > 0 else None
+        step_index = STEP_INDEX_DRAFTER_RETRY if retries > 0 else STEP_INDEX_DRAFTER
         with run_step(
             conn,
             workflow_id=wf_id,
-            step_index=STEP_INDEX_DRAFTER,
+            step_index=step_index,
             agent_name=DRAFTER_AGENT_NAME,
             now=clock,
         ) as step:
@@ -302,11 +336,59 @@ def build_crew_graph(
                 scored_company=scored_company,
                 workflow_id=wf_id,
                 log_root=log_root,
+                prior_critique=prior_critique,
             )
             step.record_cost(node_out.cost_usd)
             step.record_output_ref(node_out.output_ref)
             step.record_structured_data(node_out.structured_data)
         return {"draft": node_out.draft}
+
+    def _critic_adapter(state: CrewState) -> dict[str, Any]:
+        wf_id = state["workflow_id"]
+        draft = state["draft"]
+        scored_company = state["scored_company"]
+        profile = state["profile"]
+        raw_signals = state["raw_signals"]
+        retries = state.get("fabrication_retries", 0)
+        step_index = STEP_INDEX_CRITIC_RETRY if retries > 0 else STEP_INDEX_CRITIC
+        with run_step(
+            conn,
+            workflow_id=wf_id,
+            step_index=step_index,
+            agent_name=CRITIC_AGENT_NAME,
+            now=clock,
+        ) as step:
+            node_out = critic_node(
+                draft=draft,
+                scored_company=scored_company,
+                profile=profile,
+                raw_signals=raw_signals,
+                workflow_id=wf_id,
+                log_root=log_root,
+            )
+            step.record_cost(node_out.cost_usd)
+            if node_out.output_ref is not None:
+                step.record_output_ref(node_out.output_ref)
+            step.record_structured_data(node_out.structured_data)
+        update: dict[str, Any] = {"critique": node_out.critique}
+        # Bump retries on every failure so the router can distinguish
+        # "first failure → retry" (retries: 0 → 1) from "second failure →
+        # halt" (retries: 1 → 2). ADR-006 §1: ONE retry budget — the
+        # router refuses to schedule a second retry. A passed critique
+        # leaves retries untouched (so an approved workflow records 0 or
+        # 1 depending on whether the retry path was needed — useful audit
+        # data for Slice 8 calibration).
+        if not node_out.critique.passed:
+            update["fabrication_retries"] = retries + 1
+        return update
+
+    def _terminate_with_critic_failure(state: CrewState) -> dict[str, Any]:
+        # Persistent fabrication after the bounded retry. ADR-006 §1 specifies
+        # this is halt-worthy, not a benign empty-outcome. The node writes the
+        # terminate_reason; `_invoke_and_finalise` reads it and finalises the
+        # workflow as FAILED (rather than COMPLETED) per the terminate-reason
+        # discrimination below.
+        return {"terminate_reason": TERMINATE_REASON_CRITIC_FAILURE}
 
     def _request_drafter_approval(state: CrewState) -> dict[str, Any]:
         wf_id = state["workflow_id"]
@@ -379,13 +461,27 @@ def build_crew_graph(
             return "drafter"
         return "terminate_no_draft"
 
+    def _route_after_critic(state: CrewState) -> str:
+        critique = state.get("critique")
+        if critique is None or critique.passed:
+            return "end"
+        # ADR-006 §1: ONE bounded retry. The critic adapter bumps
+        # fabrication_retries on every failure, so retries==1 means "first
+        # failure, retry permitted"; retries>=2 means "second failure,
+        # halt loudly". A passed critique skips this branch entirely.
+        if state.get("fabrication_retries", 0) >= 2:
+            return "terminate_with_critic_failure"
+        return "drafter"
+
     builder: StateGraph[CrewState, None, CrewState, CrewState] = StateGraph(CrewState)
     builder.add_node("researcher", _researcher_adapter)
     builder.add_node("extractor", _extractor_adapter)
     builder.add_node("scorer", _scorer_adapter)
     builder.add_node("request_drafter_approval", _request_drafter_approval)
     builder.add_node("drafter", _drafter_adapter)
+    builder.add_node("critic", _critic_adapter)
     builder.add_node("terminate_no_draft", _terminate_no_draft)
+    builder.add_node("terminate_with_critic_failure", _terminate_with_critic_failure)
 
     builder.add_edge(START, "researcher")
     builder.add_edge("researcher", "extractor")
@@ -403,8 +499,18 @@ def build_crew_graph(
         _route_after_approval,
         {"drafter": "drafter", "terminate_no_draft": "terminate_no_draft"},
     )
-    builder.add_edge("drafter", END)
+    builder.add_edge("drafter", "critic")
+    builder.add_conditional_edges(
+        "critic",
+        _route_after_critic,
+        {
+            "end": END,
+            "drafter": "drafter",
+            "terminate_with_critic_failure": "terminate_with_critic_failure",
+        },
+    )
     builder.add_edge("terminate_no_draft", END)
+    builder.add_edge("terminate_with_critic_failure", END)
 
     return builder.compile(checkpointer=saver)
 
@@ -753,11 +859,15 @@ def _invoke_and_finalise(
     #   (a) `__interrupt__` present → paused at the checkpoint.
     #   (b) `draft` set in state    → drafter ran, graph reached END.
     #   (c) `terminate_reason` set  → early termination, graph reached END.
+    critique: Critique | None = None
+    fabrication_retries = 0
     if isinstance(result_state, dict):
         raw_signals = result_state.get("raw_signals")
         profile = result_state.get("profile")
         scored_company = result_state.get("scored_company")
         draft = result_state.get("draft")
+        critique = result_state.get("critique")
+        fabrication_retries = result_state.get("fabrication_retries", 0)
         terminate_reason = result_state.get("terminate_reason")
         interrupts = result_state.get("__interrupt__")
     else:  # pragma: no cover - LangGraph always returns dict for our shape
@@ -787,17 +897,71 @@ def _invoke_and_finalise(
             cost_usd=cost_total,
         )
 
-    # Reached END. Finalise COMPLETED.
+    # Reached END. Two terminal shapes here:
+    #   - critic_failure → ADR-006 §1 says persistent fabrication is
+    #     halt-worthy; finalise FAILED.
+    #   - everything else (score_gated, coverage_gated, rejected,
+    #     draft-produced) → COMPLETED.
     cost_total = recompute_cost_total(conn, wf_id)
     finished = clock().isoformat()
-    completed = workflow.model_copy(
+    is_critic_failure = terminate_reason == TERMINATE_REASON_CRITIC_FAILURE
+    terminal_status = WorkflowStatus.FAILED if is_critic_failure else WorkflowStatus.COMPLETED
+    finalised = workflow.model_copy(
         update={
-            "status": WorkflowStatus.COMPLETED,
+            "status": terminal_status,
             "finished_at": finished,
             "cost_total_usd": cost_total,
         }
     )
-    update_workflow(conn, completed)
+    update_workflow(conn, finalised)
+
+    if is_critic_failure:
+        # Persistent fabrication after the bounded retry. The critic's
+        # `agent.fabrication_detected` event is already on the audit chain
+        # via the critic adapter's run_step. Add the workflow-level
+        # workflow.failed event so the workflow's terminal fact is loud.
+        error_msg = (
+            f"crew workflow halted on persistent fabrication after one bounded retry "
+            f"(critique.failure_count="
+            f"{critique.failure_count if critique is not None else 'unknown'})"
+        )
+        emit_event(
+            conn,
+            workflow_id=wf_id,
+            event_type=EventType.WORKFLOW_FAILED,
+            level=EventLevel.ERROR,
+            message=error_msg,
+            structured_data={
+                "company_name": company_name,
+                "terminate_reason": terminate_reason,
+                "fabrication_retries": fabrication_retries,
+                "failure_count": (critique.failure_count if critique is not None else None),
+                "all_fabricated": (critique.all_fabricated if critique is not None else None),
+            },
+            timestamp=clock(),
+        )
+        log.warning(
+            "crew.run.critic_failure",
+            workflow_id=wf_id,
+            company_name=company_name,
+            fabrication_retries=fabrication_retries,
+            failure_count=(critique.failure_count if critique is not None else None),
+        )
+        return CrewResult(
+            workflow_id=wf_id,
+            status=WorkflowStatus.FAILED,
+            company_name=company_name,
+            raw_signals=raw_signals,
+            profile=profile,
+            scored_company=scored_company,
+            draft=draft,
+            critique=critique,
+            fabrication_retries=fabrication_retries,
+            terminate_reason=terminate_reason,
+            cost_usd=cost_total,
+            error_step=CRITIC_AGENT_NAME,
+            error_message=error_msg,
+        )
 
     if terminate_reason is not None:
         # Empty-outcome COMPLETED. ADR-006 §1 names this case workflow.note.
@@ -828,6 +992,8 @@ def _invoke_and_finalise(
             "cost_total_usd": cost_total,
             "produced_draft": draft is not None,
             "terminate_reason": terminate_reason,
+            "critique_passed": critique.passed if critique is not None else None,
+            "fabrication_retries": fabrication_retries,
         },
         timestamp=clock(),
     )
@@ -838,6 +1004,8 @@ def _invoke_and_finalise(
         cost_usd=cost_total,
         produced_draft=draft is not None,
         terminate_reason=terminate_reason,
+        critique_passed=critique.passed if critique is not None else None,
+        fabrication_retries=fabrication_retries,
     )
 
     return CrewResult(
@@ -848,6 +1016,8 @@ def _invoke_and_finalise(
         profile=profile,
         scored_company=scored_company,
         draft=draft,
+        critique=critique,
+        fabrication_retries=fabrication_retries,
         terminate_reason=terminate_reason,
         cost_usd=cost_total,
     )

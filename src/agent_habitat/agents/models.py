@@ -630,3 +630,264 @@ class Draft(BaseModel):
     def claim_count(self) -> int:
         """Number of enumerable claims in the Draft. Useful for audit projections."""
         return len(self.claims)
+
+
+# ---------------------------------------------------------------------------
+# Critic output — ClaimVerdict + Critique. Slice 7 (Phase 2).
+# Per ADR-006 §3 the Critic is the user-visible end of the fabrication-
+# resistance chain. It walks each `DraftClaim` down a five-hop substring
+# chain back to the Researcher's citations:
+#
+#   claim.text → DimensionScore.grounded_quote  (via claim.supporting_dimension)
+#             → ProfileField.source_spans[].quote (via the dimension's field)
+#             → Signal.text                       (via source_span.signal_index)
+#             → Citation.cited_text               (by Researcher construction)
+#
+# The substring check is MECHANICAL Python (no LLM); the Critic only makes
+# an LLM call when a claim FAILS the substring chain — to attach a
+# human-readable explanation and a "fixable_paraphrase" vs "fabricated"
+# classification (Mode 2 Option B). The substring check is the FINAL
+# ARBITER on pass/fail; the classification is metadata for retry economics.
+# ---------------------------------------------------------------------------
+
+
+CHAIN_HOPS: tuple[str, ...] = (
+    "claim_in_prose",
+    "claim_in_grounded_quote",
+    "grounded_quote_in_source_span",
+    "source_span_in_signal",
+    "signal_traces_to_citation",
+)
+"""The five hops the Critic verifies in order. A claim passes iff every hop
+holds. Names are stable so the calibration story (Slice 8) can grep by hop.
+
+  - claim_in_prose                — claim.text ⊆ Draft.prose
+  - claim_in_grounded_quote       — claim.text ⊆ DimensionScore.grounded_quote
+  - grounded_quote_in_source_span — DimensionScore.grounded_quote ⊆ one of the
+                                    cited ProfileField's source_spans[].quote
+  - source_span_in_signal         — that source_span.quote ⊆ Signal.text
+                                    (signal at source_spans[].signal_index)
+  - signal_traces_to_citation     — Signal carries the Researcher's
+                                    citation-origin markers (non-empty
+                                    source_url + text). Signal.text IS the
+                                    verbatim Citation.cited_text by
+                                    Researcher contract (see Signal model
+                                    docstring); the Critic verifies the
+                                    structural invariant rather than
+                                    holding a redundant copy of the
+                                    cited_text.
+"""
+
+
+VERDICT_CLASSIFICATIONS: tuple[str, ...] = (
+    "passed",
+    "fixable_paraphrase",
+    "fabricated",
+)
+"""Classification of one claim's verdict. Mode 2 Option B (ADR-006 §3
+calibrated middle):
+
+  - "passed"             — every hop substring-grounded; no LLM call.
+  - "fixable_paraphrase" — a hop failed, but the LLM-judged gap looks like
+                           faithful paraphrase the Drafter can fix on retry
+                           (e.g. dropped corporate suffix, synonym
+                           substitution — the Slice 5 documented patterns).
+  - "fabricated"         — a hop failed and the LLM-judged gap looks like a
+                           substantive invention with no upstream evidence.
+                           The orchestrator can use this to short-circuit
+                           retry: an all-fabricated Critique has nothing the
+                           Drafter can salvage.
+
+The classification is METADATA — it does NOT override the substring check's
+pass/fail. ADR-006 §3 specifies the substring check is final."""
+
+
+class ClaimVerdict(BaseModel):
+    """One DraftClaim's outcome from the substring chain walk.
+
+    `passed` is the mechanical truth — every hop substring-grounded after
+    `_normalise_for_substring`. `failed_hop` names the first hop that broke
+    the chain (one of `CHAIN_HOPS`) iff `passed is False`. `explanation` is
+    a human-readable summary the Drafter sees on retry; for a passed claim
+    it is an empty string. `classification` is the Mode 2 Option B
+    annotation:
+
+      - "passed" iff `passed is True`.
+      - "fixable_paraphrase" | "fabricated" iff `passed is False`.
+
+    `upstream_quote` carries the verbatim upstream text the claim should
+    have matched (the nearest grounded quote one hop upstream of
+    `failed_hop`). The Drafter retry prompt uses it to construct a
+    substring-correct revision — Slice 5's findings show that giving the
+    Drafter the EXACT verbatim quote it should embed is the load-bearing
+    signal for the retry path.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    claim_text: str = Field(
+        ...,
+        min_length=1,
+        description="Verbatim DraftClaim.text the verdict applies to.",
+    )
+    supporting_dimension: str = Field(
+        ...,
+        description="DraftClaim.supporting_dimension (a PROFILE_FIELD_NAMES member).",
+    )
+    passed: bool = Field(
+        ...,
+        description="True iff every hop in the chain substring-grounded.",
+    )
+    failed_hop: str | None = Field(
+        default=None,
+        description=(
+            "Which hop in CHAIN_HOPS broke the chain (None iff passed). "
+            "The first failing hop short-circuits the walk."
+        ),
+    )
+    explanation: str = Field(
+        default="",
+        description=(
+            "Human-readable summary the Drafter retry prompt embeds. Empty string iff passed."
+        ),
+    )
+    classification: str = Field(
+        ...,
+        description=(
+            "Mode 2 Option B annotation: 'passed' | 'fixable_paraphrase' | "
+            "'fabricated'. The substring check determines pass/fail; the "
+            "classification is retry-economics metadata."
+        ),
+    )
+    upstream_quote: str | None = Field(
+        default=None,
+        description=(
+            "Verbatim upstream text the claim should have substring-matched "
+            "(the nearest grounded quote one hop above failed_hop). None iff "
+            "passed or iff no upstream candidate exists (e.g. the claim's "
+            "supporting_dimension is excluded on the input ScoredCompany)."
+        ),
+    )
+
+    @field_validator("supporting_dimension")
+    @classmethod
+    def _supporting_dimension_in_profile_names(cls, value: str) -> str:
+        if value not in PROFILE_FIELD_NAMES:
+            raise ValueError(
+                f"supporting_dimension must be one of {PROFILE_FIELD_NAMES}; got {value!r}"
+            )
+        return value
+
+    @field_validator("failed_hop")
+    @classmethod
+    def _failed_hop_in_chain(cls, value: str | None) -> str | None:
+        if value is not None and value not in CHAIN_HOPS:
+            raise ValueError(f"failed_hop must be one of {CHAIN_HOPS} or None; got {value!r}")
+        return value
+
+    @field_validator("classification")
+    @classmethod
+    def _classification_in_allowed(cls, value: str) -> str:
+        if value not in VERDICT_CLASSIFICATIONS:
+            raise ValueError(
+                f"classification must be one of {VERDICT_CLASSIFICATIONS}; got {value!r}"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _check_passed_consistency(self) -> Self:
+        if self.passed:
+            if self.failed_hop is not None:
+                raise ValueError("ClaimVerdict.passed is True but failed_hop is set.")
+            if self.classification != "passed":
+                raise ValueError(
+                    f"ClaimVerdict.passed is True but classification={self.classification!r} "
+                    "— must be 'passed'."
+                )
+            if self.explanation:
+                raise ValueError(
+                    "ClaimVerdict.passed is True but explanation is non-empty; "
+                    "passed verdicts carry no explanation."
+                )
+            if self.upstream_quote is not None:
+                raise ValueError(
+                    "ClaimVerdict.passed is True but upstream_quote is set; "
+                    "passed verdicts carry no upstream_quote."
+                )
+        else:
+            if self.failed_hop is None:
+                raise ValueError("ClaimVerdict.passed is False but failed_hop is None.")
+            if self.classification == "passed":
+                raise ValueError(
+                    "ClaimVerdict.passed is False but classification is 'passed'; "
+                    "must be 'fixable_paraphrase' or 'fabricated'."
+                )
+            if not self.explanation:
+                raise ValueError(
+                    "ClaimVerdict.passed is False but explanation is empty; "
+                    "the Drafter retry prompt needs the explanation."
+                )
+        return self
+
+
+class Critique(BaseModel):
+    """Critic's handoff payload — per-claim verdicts + aggregate pass/fail.
+
+    `passed` is `True` iff every verdict in `verdicts` has `passed=True`.
+    Computed at construction (model_validator) so the field cannot drift
+    from the verdict list.
+
+    `verdicts` is one `ClaimVerdict` per `DraftClaim` in the input Draft,
+    in input order. A Draft with zero claims yields a `Critique` with
+    zero verdicts and `passed=True` (no claim, no failure — semantically
+    a pure-marketing-prose draft the operator should still reject for
+    being ungrounded, but that judgement is not the Critic's job).
+
+    `claim_count` and `failure_count` are computed properties used by the
+    `step.completed` projection (Slice 7 spec); auditors can browse the
+    events table without resolving JSONL refs to know whether a critic
+    run found failures.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    company_name: str = Field(..., description="The company the critique applies to.")
+    passed: bool = Field(
+        ...,
+        description="True iff every ClaimVerdict in `verdicts` has passed=True.",
+    )
+    verdicts: list[ClaimVerdict] = Field(
+        default_factory=list,
+        description="One ClaimVerdict per DraftClaim, in input order.",
+    )
+
+    @model_validator(mode="after")
+    def _passed_matches_verdicts(self) -> Self:
+        expected = all(v.passed for v in self.verdicts)
+        if self.passed != expected:
+            raise ValueError(
+                f"Critique.passed={self.passed!r} disagrees with the per-verdict "
+                f"aggregate ({expected!r}); the field cannot drift from the verdicts."
+            )
+        return self
+
+    @property
+    def claim_count(self) -> int:
+        """Number of verdicts (= number of DraftClaims the Critic walked)."""
+        return len(self.verdicts)
+
+    @property
+    def failure_count(self) -> int:
+        """Number of failed verdicts. Zero iff `passed`."""
+        return sum(1 for v in self.verdicts if not v.passed)
+
+    @property
+    def all_fabricated(self) -> bool:
+        """True iff there is at least one failure AND every failure is
+        classified 'fabricated'. Used by the orchestrator to short-circuit
+        retry: an all-fabricated Critique has nothing the Drafter can salvage.
+        """
+        failures = [v for v in self.verdicts if not v.passed]
+        if not failures:
+            return False
+        return all(v.classification == "fabricated" for v in failures)

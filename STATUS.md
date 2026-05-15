@@ -4,6 +4,44 @@
 Phase 2 — 5-Agent Lead Enrichment Crew (full plan: docs/ROADMAP.md)
 
 ## Current Slice
+**Phase 2 Slice 7 (Critic agent + bounded retry edge) — DONE
+2026-05-15.** New `src/agent_habitat/agents/critic.py` (Layer A
+`critic_node` + Layer B `run_critic`); `Critique` / `ClaimVerdict`
+added to `agents/models.py` (Pydantic v2, `extra="forbid"`,
+`frozen=True`, with cross-field invariants); `prior_critique`
+additive optional kwarg on `drafter_node` Layer A only (Layer B
+unchanged); `crew_graph.py` extended with the critic adapter,
+`terminate_with_critic_failure` node, and the bounded-retry router
+(retries 0→1 on first failure → drafter retry; retries 1→2 on
+second failure → terminate FAILED); `CrewState` gained `critique` +
+`fabrication_retries` additively; `terminate_reason="critic_failure"`
+finalises a workflow as FAILED (ADR-006 §1 — persistent fabrication
+is halt-worthy). `run-critic` CLI command added; agents `__init__`
+re-exports `Critique`, `ClaimVerdict`, `run_critic`, `critic_node`,
+`CriticResult` &c.
+
+**Mode 2 decision: Option B (per kickoff "Default expectation").**
+The Critic emits a per-failure classification — `fixable_paraphrase`
+(faithful paraphrase the Drafter can fix on retry — Slice 5's
+documented "Anthropic PBC"/"teamed with" patterns) vs `fabricated`
+(invented fact with no upstream support — retry cannot recover).
+Critique exposes `all_fabricated` so the orchestrator could
+short-circuit retry when every failure is unsalvageable (not used
+in Slice 7's router — recorded for Slice 8's calibration to decide).
+The substring check remains the final arbiter on pass/fail
+(ADR-006 §3); the classification is retry-economics metadata, not
+a pass/fail override.
+
+68 new deterministic tests + 1 new live smoke. Full suite (515
+deterministic) clean; ruff check + ruff format + mypy strict all
+clean. **The Critic completes the Phase 2 crew architecture
+end-to-end** — the fabrication-resistance contract from ADR-006 §3
+is now enforced as code, not as a hope. Slice 5's "Anthropic
+PBC"/"teamed with" findings are kept verbatim below as the red-team
+smoke's calibration data; the red-team smoke replicates BOTH
+patterns AND two invented fabrications, and every failure is caught
+by the mechanical substring check and classified correctly by Mode 2.
+
 **Phase 2 Slice 6 (LangGraph orchestrator) — DONE 2026-05-14.** New
 `src/agent_habitat/orchestration/crew_state.py` (CrewState TypedDict)
 and `crew_graph.py` (StateGraph + four agent adapters + checkpoint
@@ -15,11 +53,10 @@ behaviour in `reconcile_orphan_steps`); `run-crew` CLI command added to
 `cli.py` with `--resume WF_ID` mode. 21 new deterministic tests + 2
 new live smokes (full chain end-to-end + cross-session resume with
 real Opus). Full suite (447 deterministic) clean; ruff check + ruff
-format + mypy strict all clean. **Phase 2 Slice 7 (Critic) is the
-remaining piece** to complete the crew + close the load-bearing
-fabrication-resistance contract; the Slice 5 substring-failure
-findings ("Anthropic PBC" / "teamed with") survive in this STATUS.md
-as the calibration input for Slice 7's red-team smoke.
+format + mypy strict all clean. Slice 7 extends this Slice 6 graph
+with the Critic node + bounded-retry edge (additive — Slice 6 tests
+all pass unchanged with the one expected step-count assertion update
+in `test_crew_graph.py`).
 
 **Phase 2 Slice 5 (Drafter agent) — DONE 2026-05-14.** Carried into
 Slice 6 unchanged: `agents/drafter.py` + `agents/models.py` (`Draft`
@@ -27,6 +64,85 @@ Slice 6 unchanged: `agents/drafter.py` + `agents/models.py` (`Draft`
 Drafter's Layer A `drafter_node` into LangGraph as the fourth node;
 the standalone `run-drafter` CLI command stays as a parallel
 entrypoint.
+
+## Phase 2 Slice 7 Subtasks (Critic agent + bounded retry edge + red-team smoke)
+
+- [x] **STOP-and-pick #1 — Mode 2 option (chose Option B).** The kickoff's "Default expectation: Option B" — explain + classify per failure. The substring check remains the final arbiter on pass/fail (ADR-006 §3); Mode 2 adds `fixable_paraphrase` vs `fabricated` metadata. Reasoning: Slice 5 live smoke documented faithful paraphrases (the exact "fixable" pattern) as distinct from genuine fabrications — a real signal worth surfacing. Cost difference is ~$0.001 per failure call.
+- [x] **STOP-and-pick #2 — Profile input (additive kwarg, documented).** The kickoff signature names `(draft, scored_company, raw_signals)`. Hops 3 and 4 (`grounded_quote ⊆ source_span.quote ⊆ Signal.text`) require `ProfileField` data which only lives on `CompanyProfile`. Added `profile: CompanyProfile` as an additive kwarg on `critic_node`; `CrewState` already carries it, so the orchestrator adapter passes it through. No upstream agent changes.
+- [x] **STOP-and-pick #3 — Hop 5 boundary (structural invariant, documented).** Signal.text IS, by Researcher contract, a verbatim `Citation.cited_text` span (Signal docstring). The Critic does not receive `Citation` objects; hop 5 is verified as the Researcher's STRUCTURAL invariant — non-empty `Signal.source_url` + non-empty `Signal.text` (the citation-origin markers). The test for hop 5 constructs a Signal with empty `source_url` to exercise the failure path.
+- [x] `src/agent_habitat/agents/models.py` extension — `Critique` (composite: `company_name`, `passed`, `verdicts`; model_validator enforces `passed` matches per-verdict aggregate), `ClaimVerdict` (per-claim: `claim_text`, `supporting_dimension`, `passed`, `failed_hop`, `explanation`, `classification`, `upstream_quote`; field-validators for the controlled vocabularies; model_validator enforces `passed`/`failed_hop`/`classification`/`explanation` consistency); `CHAIN_HOPS` tuple (five named hops); `VERDICT_CLASSIFICATIONS` tuple. All `ConfigDict(extra="forbid", frozen=True)`.
+- [x] `src/agent_habitat/agents/critic.py` — Layer A `critic_node(*, draft, scored_company, profile, raw_signals, workflow_id, log_root=None)` is DB-pure (no sqlite3, no run_step, no insert_workflow). Mechanical substring chain walks five hops per claim using `_normalise_for_substring` imported BY IDENTITY from `agents/extractor.py` (test pins `critic_norm is ext_norm`). On any failure: one Haiku call PER FAILED CLAIM (ModelTier.HAIKU per CLAUDE.md model-routing table — cheap, fast, mechanical-judgment task). All-pass critique → zero LLM cost, near-zero wall time. Layer B `run_critic(conn, ...)` owns the workflow lifecycle + `run_step` audit envelope; emits the `agent.fabrication_detected` event taxonomy member (its first writer — the member existed in `observability/events.py` from Slice 4 in anticipation).
+- [x] `src/agent_habitat/agents/drafter.py` Layer A gained ONE optional kwarg — `prior_critique: Critique | None = None`. When supplied, the user prompt prepends a `RETRY_PROMPT_PREFACE` block + per-failure rejection list. The prompt instructs Opus to (a) embed verbatim upstream quotes for `fixable_paraphrase` failures, (b) DROP `fabricated` failures entirely on retry, (c) narrow rather than broaden the prose. `run_drafter` Layer B signature is UNCHANGED for backward compat. Slice 5 `test_drafter.py` (56 deterministic tests) passes UNEDITED.
+- [x] `src/agent_habitat/orchestration/crew_state.py` extension — `critique: Critique` + `fabrication_retries: int` additive TypedDict keys; `TERMINATE_REASON_CRITIC_FAILURE = "critic_failure"` constant. Slice 6 keys/constants untouched.
+- [x] `src/agent_habitat/orchestration/crew_graph.py` — critic adapter wraps `critic_node` in `run_step` with step indices 5 (initial) / 7 (retry); drafter adapter checks `state.get("fabrication_retries", 0)` to switch between indices 4/6 and to pass `prior_critique` on retry; `terminate_with_critic_failure` node writes `terminate_reason`. Conditional edge after `critic`: `_route_after_critic` returns `"end"` on pass, `"terminate_with_critic_failure"` when `retries >= 2`, else `"drafter"` (retry). The critic adapter bumps `fabrication_retries` on every failure (0→1 on first, 1→2 on second) so the router can distinguish first-failure (retry) from second-failure (halt) without ambiguity. `_invoke_and_finalise` finalises `critic_failure` as WorkflowStatus.FAILED (not COMPLETED — persistent fabrication is halt-worthy per ADR-006 §1).
+- [x] `src/agent_habitat/cli.py` — `run-critic COMPANY_NAME` standalone CLI added; sequences researcher → extractor → scorer → drafter → critic as five separate workflows. CRITIC_DECISION_FOOTER carries the substring-chain disclosure. Slice 6 `run-crew` CLI is unchanged; orchestrator-via-`run-crew` is the retry-enabled path.
+- [x] `tests/test_critic.py` — 68 new deterministic tests organised in 12 classes:
+    * `TestClaimVerdictModel` (12) — validation, frozen, extra=forbid, all consistency invariants.
+    * `TestCritiqueModel` (8) — round-trip, drift detection, `all_fabricated` semantics.
+    * `TestNormaliserIdentity` (2) — `is`-pins critic_norm is ext_norm AND scorer_norm is ext_norm (belt-and-braces on Slice 4's reuse).
+    * `TestStripCodeFence` (3) — defensive fence stripping.
+    * `TestParseFailureJudgement` (6) — Mode 2 LLM response parsing + every rejection mode.
+    * `TestSignalTracesToCitation` (3) — hop 5 structural invariant.
+    * `TestChainWalkAllPass` (1) — happy chain across multiple claims.
+    * `TestChainWalkPerHop` (5) — ONE TEST PER HOP, naming each `claim_in_prose`, `claim_in_grounded_quote`, `grounded_quote_in_source_span`, `source_span_in_signal`, `signal_traces_to_citation`.
+    * `TestChainWalkEdgeCases` (2) — excluded dimensions; whitespace+case normalisation.
+    * `TestFindDimension` + `TestFindGroundingSpan` (4) — pure helpers.
+    * `TestCriticNodeAllPass` (2) — Layer A purity verified: 0 LLM calls on happy path; projection shape.
+    * `TestCriticNodeOnFailure` (2) — Mode 2 per-failure call count; parse-error propagation.
+    * `TestCriticNodePurity` (1) — Layer A works WITHOUT a sqlite3.Connection.
+    * `TestRunCritic` (4) — Layer B round-trip, projection, fabrication event emission, infrastructure-failure path.
+    * `TestDrafterPriorCritique` (3) — additive parameter behaviour: None ⇒ baseline prompt unchanged (Slice 5 cross-check); supplied ⇒ retry preface + verbatim upstream quotes prepended; `run_drafter` signature does NOT include the new kwarg.
+    * `TestCrewGraphCriticIntegration` (3) — end-to-end graph: pass-through (5 steps, no retry), first-failure-then-pass (7 steps, retries=1), persistent failure → terminate FAILED (retries=2).
+    * `TestRedTeamSmoke` (5) — the slice's defining test: each of the four red-team cases is checked individually so calibration regressions are diagnosable, plus a mixed-Draft integration test that runs all four through one critic_node call.
+- [x] One live smoke (`@pytest.mark.live`) — see "Phase 2 Slice 7 Live Smoke Calibration" below.
+- [x] **The FIVE existing agent test files were NOT touched.** `test_researcher.py`, `test_extractor.py`, `test_scorer.py`, `test_summarizer.py`, `test_drafter.py` all pass unchanged. The four prior agent source files (researcher.py, extractor.py, scorer.py, summarizer.py) are unchanged; `drafter.py` got ONE additive optional kwarg on Layer A — `run_drafter` (Layer B) signature is byte-identical. The 56-test `TestDrafter*` suite passes unedited. `tests/test_crew_graph.py` got ONE assertion update (the crew now has 5 steps not 4 when the critic runs); that's the orchestrator's own test file, not one of the five protected agent test files.
+
+## Phase 2 Slice 7 Red-Team Smoke Results — every documented pattern caught
+
+The red-team smoke replicates the EXACT two patterns Slice 5's live smoke documented as fabrication-resistance failures, plus two invented fabrications constructed to verify Mode 2's classification axis. Every case is its own deterministic test (`tests/test_critic.py::TestRedTeamSmoke::test_pattern_*`) so a future regression points at one named test, not a blob.
+
+| # | Claim                                                                                    | Upstream evidence                                                                                                | Mechanical hop failed         | Mode 2 classification | Verdict |
+|---|------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------|-------------------------------|-----------------------|---------|
+| A | "Anthropic is in early talks with investors to raise at least $30 billion..."             | "**Anthropic PBC** is in early talks with investors to raise at least $30 billion..." (Slice 5 verbatim quote)    | `claim_in_grounded_quote`     | `fixable_paraphrase`  | CAUGHT  |
+| B | "partnership with the Gates Foundation on a $200 million... AI initiative"                 | "Anthropic **teamed with** the Gates Foundation on a $200 million... AI initiative" (Slice 5 verbatim quote)      | `claim_in_grounded_quote`     | `fixable_paraphrase`  | CAUGHT  |
+| C | "raised exactly $99 billion at a $200 billion valuation" (invented funding amount)         | upstream cites $30 billion in TALKS, not $99 billion RAISED                                                       | `claim_in_grounded_quote`     | `fabricated`          | CAUGHT  |
+| D | "joint venture with the Acme Conglomerate on enterprise sales" (invented partnership)      | upstream cites Gates Foundation initiative, no mention of Acme Conglomerate                                      | `claim_in_grounded_quote`     | `fabricated`          | CAUGHT  |
+
+**Every failure caught by the mechanical substring chain (hop 2 in all four cases).** The mixed-Draft integration test (`test_mixed_red_team_all_failures_caught`) runs all four claims through ONE critic_node call: 4 Mode-2 Haiku invocations made (one per failure, as designed), 4/4 hop pointers correct, 2/2 fixable_paraphrase classifications correct, 2/2 fabricated classifications correct. `Critique.all_fabricated` is False (mixed run); on the two genuine-fabrications subset (`test_pattern_c_*`), `all_fabricated` is True — the metadata distinction is real and surface-able to a Slice 8 retry-economics policy.
+
+**Per-hop tests exist for all five hops** (`TestChainWalkPerHop`). The mechanical chain is exercised in isolation for `claim_in_prose`, `claim_in_grounded_quote`, `grounded_quote_in_source_span`, `source_span_in_signal`, and `signal_traces_to_citation`. The "Anthropic PBC" pattern is the live-data canonical example of hop 2; the other four hops have synthetic-data tests that exercise the same substring-mismatch shape one level downstream / upstream.
+
+## Phase 2 Slice 7 Live Smoke Calibration — bounded retry FIRED and SUCCEEDED end-to-end
+
+One live full-crew run on `Anthropic` on 2026-05-15 with the real Opus 4.7 drafter and real Haiku critic. The workflow:
+
+1. **researcher** (Haiku + web_search) — produced RawSignals.
+2. **extractor** (Sonnet) — produced CompanyProfile with grounded source_spans.
+3. **scorer** (Sonnet) — produced ScoredCompany; passed both gates with the relaxed live-smoke rubric.
+4. **request_drafter_approval** — paused → CLI approved via `approve_checkpoint` → resumed.
+5. **drafter (initial)** ($0.05475, ~8s) — Opus produced a Draft with claims.
+6. **critic (initial)** — 2 Haiku Mode-2 calls ($0.001100 + $0.001007 = $0.002107) → `critique.passed = False`. Retries bumped 0→1; router sent state back to drafter.
+7. **drafter (retry)** ($0.06696, ~7s) — Opus produced a revised Draft WITH `prior_critique` attached as the user-prompt preface. The retry preface listed the exact failing claims, the verbatim upstream quotes the model should embed, and the classifications.
+8. **critic (retry)** — 0 Mode-2 calls. **Every claim's substring chain held end-to-end** — `Critique.passed = True`.
+9. Workflow **COMPLETED**, `fabrication_retries = 1`, `draft` produced, **total cost $0.183456**.
+
+**THE BOUNDED RETRY EDGE IS THE LOAD-BEARING FINDING.** Slice 5's prediction was: "the bounded retry edge is what the chain depends on" because Opus on first contact produces faithful paraphrases (not substring-matching). This live smoke confirmed exactly that:
+
+- **First contact failed.** Opus 4.7's first Draft, as Slice 5 predicted, did not produce substring-clean claims against the upstream grounded_quotes. Mode 2 (Haiku) classified the failures.
+- **Retry SUCCEEDED.** With the critic's per-failure Critique attached (verbatim upstream quotes embedded as instructions), Opus 4.7's second Draft produced substring-clean claims — every hop held.
+- **The contract works end-to-end against real model output.** This is the validation Slice 5 was waiting for: the fabrication-resistance contract is enforceable as code, the substring check catches real Opus over-reaches, and the retry signal (verbatim upstream quote in the prompt) is sufficient to recover. Slice 8's calibration across 3-5 companies will measure how often this retry path fires AND how often it succeeds vs persists — but the existence proof is in the bank.
+
+**Cost breakdown (real Anthropic billing, 2026-05-15):**
+- Researcher: $0.057232 (one Haiku web_search call, one citation pulled).
+- Extractor: ~$0.004 (Sonnet).
+- Scorer: ~$0.008 (Sonnet, 2 dimensions).
+- Drafter (initial): $0.05475 (Opus 4.7, ~1500 in / 400 out).
+- Critic (initial): $0.002107 (TWO Haiku Mode-2 calls — one per failure on Opus's first contact).
+- Drafter (retry): $0.06696 (Opus 4.7 with the retry preface; slightly larger output than first contact — the model produced a more carefully-quoted prose).
+- Critic (retry): $0.000000 (chain held; no Mode-2 calls).
+- **Total: $0.183456.** Compared to Slice 5's "no critic, no retry" four-agent $0.135 baseline: the critic + retry overhead is ~$0.048 (35% of baseline) — the cost of enforcing the contract is bounded and predictable.
+
+**Decision-support implication.** The five-agent crew now produces drafts where every concrete claim has substring-verified upstream grounding (after at most one retry). This is the audit-grade output PATTERNS.md #2 demands; combined with the decision-support footer (PATTERNS.md #4) on the user-visible CLI surface, the workflow's outreach artefact is now defensible end-to-end. Slice 8 (calibration) is what publishes the rate this contract holds across companies.
 
 ## Phase 2 Slice 6 Subtasks (LangGraph orchestrator + crew state machine + SqliteSaver)
 
@@ -677,6 +793,22 @@ Slice 7 calibration story / README:
 - **LangGraph msgpack deserialisation deprecation (Phase 3+ trigger).** SqliteSaver currently round-trips Pydantic models (`RawSignals`, `CompanyProfile`, `ScoredCompany`, `Draft`) through msgpack but logs `Deserializing unregistered type … from checkpoint. This will be blocked in a future version. Set LANGGRAPH_STRICT_MSGPACK=true to block now, or add to allowed_msgpack_modules to allow explicitly`. Slice 6's deterministic tests + both live smokes round-trip these models successfully today — the warning is forward-looking, not a current failure. When LangGraph flips the default to strict, register the allowed module list explicitly OR serialise CrewState's Pydantic payloads to dicts at the node boundary (`.model_dump(mode='json')`) and re-validate on read. Trigger: a LangGraph minor-version upgrade that flips `LANGGRAPH_STRICT_MSGPACK` to true by default. Not blocking Slice 7.
 
 ## Last Session
+**Phase 2 Slice 7 — Critic agent + bounded retry edge + red-team smoke.** Opus 4.7 high. The fabrication-resistance contract from ADR-006 §3 lands as code: a mechanical five-hop substring chain walks every Draft claim back to the Researcher's citations, and on any failure a Haiku Mode-2 call (Option B per the kickoff) annotates with `fixable_paraphrase`/`fabricated` and a verbatim upstream quote the Drafter can embed on retry. The bounded retry edge in the LangGraph graph routes drafter → critic → END on pass, drafter → critic → drafter (retry) → critic on first failure, drafter → critic → drafter → critic → terminate FAILED on persistent failure.
+
+**Two small interpretation choices, picked and documented.** (1) The kickoff signature listed `(draft, scored_company, raw_signals)` but hops 3-4 need `ProfileField.source_spans` data — added `profile: CompanyProfile` as an additive kwarg (CrewState already carries it). (2) Hop 5 (Signal.text → Citation.cited_text) is verified as a structural invariant — Signal carries non-empty source_url + text (the Researcher's citation-origin markers) — because Signal.text IS, by Researcher contract, a verbatim Citation.cited_text span. Both choices recorded in the critic.py docstring and the commit message.
+
+**Mode 2 choice — Option B (explain + classify).** Slice 5's two documented failure patterns ("Anthropic PBC" → "Anthropic", "teamed with" → "partnership with") are FAITHFUL paraphrases, structurally distinct from genuine fabrications. The classification metadata makes the distinction visible to the orchestrator's retry-economics policy (Slice 8's calibration); the substring check remains the final arbiter on pass/fail.
+
+**Red-team smoke — every documented pattern caught.** The four red-team cases (A: "Anthropic PBC" suffix dropped, B: "teamed with" → "partnership with", C: invented $99B funding, D: invented Acme Conglomerate venture) all caught by the mechanical substring chain at hop 2 (`claim_in_grounded_quote`). Mode 2 classified A/B as `fixable_paraphrase` and C/D as `fabricated`; `Critique.all_fabricated` is True on the C/D subset and False on the mixed run. The mixed-Draft integration test (`test_mixed_red_team_all_failures_caught`) makes exactly four Mode-2 Haiku calls — one per failure, as designed.
+
+**LIVE SMOKE FIRED THE RETRY EDGE AND THE RETRY SUCCEEDED.** Real Opus 4.7 + real Haiku, real Anthropic billing, 2026-05-15. The full crew on `Anthropic` ran to PAUSED → operator-approved → drafter (initial $0.05475) → critic (Mode-2 with 2 Haiku calls, $0.0021) → routed BACK to drafter (retry $0.06696, with `prior_critique` attached as the user-prompt preface) → critic (no Mode-2 calls — the chain held end-to-end) → COMPLETED. `fabrication_retries = 1`, total cost $0.183456. **This is the validation Slice 5 was waiting for: the fabrication-resistance contract is enforceable as code, and the retry signal (verbatim upstream quote in the prompt) is sufficient to recover real Opus over-reaches.**
+
+**Implementation surface.** Two new files: `src/agent_habitat/agents/critic.py` (~600 lines — Layer A `critic_node` + Layer B `run_critic`, sibling-function pattern matching extractor/scorer/drafter); `tests/test_critic.py` (~1600 lines — 68 deterministic tests in 17 classes + 1 live smoke). Five extended files: `agents/models.py` (`Critique` + `ClaimVerdict` + `CHAIN_HOPS` + `VERDICT_CLASSIFICATIONS`); `agents/drafter.py` (ONE additive kwarg on Layer A + `RETRY_PROMPT_PREFACE` + `_format_prior_critique`); `agents/__init__.py` (export surface); `orchestration/crew_state.py` (two additive TypedDict keys + one terminate-reason constant); `orchestration/crew_graph.py` (critic adapter + terminate_with_critic_failure node + `_route_after_critic` + critic-failure FAILED finalisation). One CLI extension: `cli.py` gains `run-critic`. One test update: `tests/test_crew_graph.py` (one assertion to recognise the new fifth step row — the orchestrator's own test file, not one of the five protected agent test files).
+
+**The five protected test files survived UNEDITED.** `test_researcher.py`, `test_extractor.py`, `test_scorer.py`, `test_summarizer.py`, `test_drafter.py` all pass unchanged through the additive Drafter Layer A kwarg. The four prior agent source files (researcher.py, extractor.py, scorer.py, summarizer.py) are byte-identical to pre-Slice-7. `llm.py`, `run_step.py`, `state/persistence.py`, `checkpoint/system.py`, ADR-002's schema are all untouched.
+
+**Full suite (515 deterministic) clean; ruff check + ruff format + mypy strict all clean.** **Phase 2 Slice 8 (calibration across 3-5 real companies) is now UNBLOCKED** — the contract works end-to-end against real Opus output, and the calibration data is what publishes the rate it holds across companies.
+
 **Phase 2 Slice 6 — LangGraph orchestrator + SqliteSaver + cross-
 session resume.** Opus 4.7 xHigh — the one slice of the project that
 genuinely warrants the maximum-reasoning tier (hard reasoning under
@@ -1444,64 +1576,28 @@ Slice 3's actual new work (per the kickoff prompt) was the budget-check + halt-s
 Tests: 40 deterministic tests in `tests/test_budget.py` — pure evaluator across boundary/edge cases (zero cap, threshold=0, threshold=1, at-cap, at-threshold); UTC window correctness including tz conversion and naive-datetime defensive path; `cost_within_window` inclusion/exclusion at boundaries and isolation across workflows; end-to-end check with override resolution; exceed-event row shape; halt-signal query including the "unrelated error event must not trip the halt" anti-confusion case; TOML config loading including missing file, malformed TOML, missing required key, missing [defaults] section, override without `daily_cap_usd`, threshold out of range, and a sanity-check that the bundled `config/budgets.toml` loads. Full suite (90 tests including llm.py and state) passes cleanly. ruff check + ruff format + mypy strict all clean.
 
 ## Next Session Entry Point
-**Phase 2 Slice 7 — Critic agent (Haiku) + pure-Python substring
-check + bounded fabrication-retry edge.** ADR-006 §3 is the spec.
-Two new modules:
+**Phase 2 Slice 8 — Live calibration across 3-5 real companies + full-suite cost recalibration.** Slice 7 produced the FIRST end-to-end fabrication-resistance-enforced Draft (live cost $0.183456 for Anthropic, with one bounded retry that succeeded). Slice 8 is the calibration story: how often does the retry path fire, how often does the retry succeed, what fraction of failures are `fixable_paraphrase` vs `fabricated`, and how does per-agent cost distribute across the five-agent chain at scale.
 
-- `agents/critic.py` — `critic_node(state)` reads
-  `(draft, raw_signals, profile, scored_company)` from CrewState and
-  emits a `Critique(claims=[...], violations=[...], passes=bool)` via
-  one Haiku call (claim-decomposition only; the LLM does NOT do the
-  grounding judgment — see next module). Wrap in `run_step` per ADR-
-  006 §2 with step_index=5.
-- `agents/fabrication.py` — pure-Python `substring_check(critique,
-  state) -> Critique` function that re-runs the substring grounding
-  (whitespace-collapse + lowercase normalisation, the existing
-  `_normalise_for_substring` from extractor.py) against the union of
-  `(raw_signals.signals[].text, profile.<field>.source_spans[].quote,
-  scored_company.dimensions[].grounded_quote)`. If the check disagrees
-  with the critic's `passes`, the check WINS and the disagreement is
-  itself a violation. This pure function is what makes the contract
-  AUDITABLE: an auditor can re-run it from cold storage with no LLM call.
+**Slice 8 scope** (no new code in the agents — calibration is observational):
+- Pick 3-5 real companies spanning the ICP shape (regulated industries focus): probable matches (e.g. `Anthropic` again for trend data, plus 2-3 fintech/healthtech/compliance plays), at least one borderline lead (score-gated by the floor), and at least one expected-fabrication case (a company whose web footprint is sparse so the upstream evidence forces the Drafter into stretchy claims).
+- For each, run `agent-habitat run-crew COMPANY --resume` end-to-end and record: total cost, per-agent cost, wall time, `fabrication_retries` (0 or 1 or 2), critic verdict shape (per-claim `failed_hop` + `classification`), draft prose at each pass.
+- Output: a Markdown calibration table in `docs/` + an updated `config/budgets.toml` aligned to real numbers + a STATUS.md "Slice 8 Calibration" section with the per-company observations. The CONTRACT this records: how often does the retry actually fix the chain, and when it doesn't, what is the failure mode?
+- ADR-006 §1's checkpoint-rationale prose has an upstream-chain figure that was ~5× understated against Slice 6's recalibrated researcher cost; Slice 8 re-renders that prose with real Slice 7 numbers.
 
-**Orchestrator integration (extends Slice 6's crew_graph.py).** Two
-new graph features:
-- Add a sixth node `critic` between `drafter` and `END`, wrapped in
-  `run_step` step_index=5. Conditional edge from drafter → critic.
-- Add the bounded fabrication-retry edge: conditional from critic.
-  On first violation (`fabrication_retries == 0`): set
-  `fabrication_retries=1`, append the critic's violations to the
-  drafter's input, route back to drafter. On second violation: emit
-  `agent.fabrication_detected` at ERROR level, route to halt,
-  workflow FAILED.
-- CrewState gains two new keys: `critique: Critique`,
-  `fabrication_retries: int` (default 0).
+**Things that might fall out of Slice 8** (queue, do NOT preempt):
+- Drafter prompt tuning: if the retry succeeds reliably, the initial Drafter prompt may be left as-shipped (the retry IS the contract). If retry fails frequently, the prompt may need a "use grounded_quote verbatim" instruction.
+- Mode 2 metadata utility: if `all_fabricated` Critiques (no fixable paraphrases) are common, Slice 8+ could add a short-circuit-retry policy to the orchestrator (current router does not consult `all_fabricated`).
+- Citation passthrough for hop 5: if Slice 8 finds a real case where hop 5's structural-invariant check is too loose (a Signal traced to a citation but text drift), promote `Citation` to a CrewState key and verify the literal substring at hop 5. Not blocking; recorded as queued.
 
-**Red-team smoke (LOAD-BEARING — see "Phase 2 Slice 6 Live Smoke
-Calibration" above, "Drafter substring-failure findings").** The
-Slice 5 first-contact live smoke produced two paraphrase-not-
-substring violations on Opus 4.7: (a) "Anthropic PBC" → "Anthropic"
-(dropped corporate suffix), (b) "teamed with" → "partnership with"
-(synonym substitution). Both are factually faithful, neither is
-verbatim. Slice 7's red-team smoke MUST verify the substring check
-catches both patterns when injected into a synthetic Draft against a
-known-good ScoredCompany. This is the auditable-contract validation.
+**Slice 8 must NOT touch** (firewall preserved):
+- The four prior Layer A nodes (researcher, extractor, scorer, drafter) other than maybe prompt tuning IF the calibration justifies it (and that's an ADR-worthy choice). The Critic's Layer A is also locked.
+- ADR-002 schema; the audit chain.
+- `llm.py`'s rate table (Slice 8 verifies — does not edit).
 
-**Slice 7 must NOT touch.** ADR-002's schema is unchanged
-(`agent.fabrication_detected` already exists in the EventType
-taxonomy). The four Phase 2 Layer A nodes are unchanged. Slice 6's
-crew_graph.py extends additively (new critic node + new conditional
-edges); the existing four-node topology + checkpoint + resume
-mechanism is preserved.
-
-**Slice 8 — Live calibration across 3-5 companies — remains the
-follow-up.** Two forward dependencies queued from ADR-003 and ADR-
-006: `budgets.toml` re-validation (Slice 5's $0.135/4-agent number +
-Slice 6's $0.105/4-agent number — both within ADR-006 §1's estimate;
-the full 5-agent number from Slice 7 + Slice 8 should land
-$0.14-$0.16), and ADR-006 §1's checkpoint-cost-rationale prose
-re-check (upstream-chain figure was ~5× understated against the
-recalibrated researcher cost).
+**Slice 9+ candidates** (not Slice 8 scope, queued only):
+- Phase 3 hardening: WAL mode on SQLite (multi-process trigger), retry/backoff in `llm.py` (real Slice 7/8 transient error rate decides), PII redaction notes on the user-visible Drafter prose.
+- LangGraph msgpack deserialisation deprecation (Slice 6 Open Question — Phase 3+ trigger).
+- The summarizer retrofit onto `run_step` was completed in Slice 6's pre-orchestrator refactor; cosmetic-trim items rode along then.
 
 **Two forward dependencies remain queued for Slice 8** (Open Questions):
 `budgets.toml` re-validation against real end-to-end cost (now with

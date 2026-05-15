@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from typing import TypedDict
 
-from ..agents.models import CompanyProfile, Draft, RawSignals, ScoredCompany
+from ..agents.models import CompanyProfile, Critique, Draft, RawSignals, ScoredCompany
 
 
 class CrewState(TypedDict, total=False):
@@ -40,15 +40,22 @@ class CrewState(TypedDict, total=False):
 
     Field ownership (which adapter writes which key):
 
-      researcher_adapter        → raw_signals
-      extractor_adapter         → profile
-      scorer_adapter            → scored_company
-      request_drafter_approval  → drafter_approved
-      drafter_adapter           → draft
-      terminate_no_draft        → terminate_reason
+      researcher_adapter            → raw_signals
+      extractor_adapter             → profile
+      scorer_adapter                → scored_company
+      request_drafter_approval      → drafter_approved
+      drafter_adapter               → draft
+      critic_adapter                → critique, fabrication_retries
+      terminate_no_draft            → terminate_reason
+      terminate_with_critic_failure → terminate_reason
 
     `workflow_id` and `company_name` are set by the orchestrator entry
     point (`run_crew`) before the first `graph.invoke`.
+
+    `critique` and `fabrication_retries` (Slice 7) are additive to the
+    Slice 6 state shape — the bounded-retry edge per ADR-006 §1 lives
+    here. `fabrication_retries` starts at 0 (implicit, `total=False`);
+    the critic adapter increments it before routing back to the drafter.
     """
 
     workflow_id: str
@@ -58,22 +65,29 @@ class CrewState(TypedDict, total=False):
     scored_company: ScoredCompany
     drafter_approved: bool
     draft: Draft
+    critique: Critique
+    fabrication_retries: int
     terminate_reason: str
 
 
 # Reasons recorded on `CrewState.terminate_reason` when the workflow ends
-# without producing a draft. These distinguish the three structurally-
-# different empty-outcomes per ADR-006 §1: the gated-by-score case, the
-# gated-by-coverage case, and the human-rejection case. All three finalise
-# the workflow as COMPLETED (gating is not a failure); the audit row's
-# `workflow.note` event names the reason.
+# without producing a draft. These distinguish the four structurally-
+# different empty-outcomes per ADR-006 §1 + §3: the gated-by-score case,
+# the gated-by-coverage case, the human-rejection case, and the Slice 7
+# critic-rejection case (fabrication-retry exhausted). All four finalise
+# the workflow as COMPLETED in the COMPLETED-no-draft sense for the first
+# three; the critic-failure case finalises FAILED per ADR-006 §1 (a
+# persistent fabrication is a halt-worthy contract violation, not a
+# benign empty-outcome).
 TERMINATE_REASON_SCORE_GATED = "score_gated"
 TERMINATE_REASON_COVERAGE_GATED = "coverage_gated"
 TERMINATE_REASON_REJECTED = "rejected"
+TERMINATE_REASON_CRITIC_FAILURE = "critic_failure"
 
 
 __all__ = [
     "TERMINATE_REASON_COVERAGE_GATED",
+    "TERMINATE_REASON_CRITIC_FAILURE",
     "TERMINATE_REASON_REJECTED",
     "TERMINATE_REASON_SCORE_GATED",
     "CrewState",

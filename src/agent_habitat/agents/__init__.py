@@ -1,5 +1,12 @@
 """agent-habitat agents — single-agent demos in Phase 1, multi-agent crew in Phase 2."""
 
+from .critic import (
+    CriticError,
+    CriticParseError,
+    CriticResult,
+    critic_node,
+    run_critic,
+)
 from .drafter import (
     DrafterCalledBelowFloorError,
     DrafterError,
@@ -9,7 +16,9 @@ from .drafter import (
 )
 from .extractor import ExtractorParseError, ExtractorResult, run_extractor
 from .models import (
+    ClaimVerdict,
     CompanyProfile,
+    Critique,
     DimensionScore,
     Draft,
     DraftClaim,
@@ -31,7 +40,12 @@ from .summarizer import (
 )
 
 __all__ = [
+    "ClaimVerdict",
     "CompanyProfile",
+    "CriticError",
+    "CriticParseError",
+    "CriticResult",
+    "Critique",
     "DimensionScore",
     "Draft",
     "DraftClaim",
@@ -52,8 +66,10 @@ __all__ = [
     "SourceSpan",
     "SummarizerError",
     "SummarizerResult",
+    "critic_node",
     "extract_readable_text",
     "fetch_url",
+    "run_critic",
     "run_drafter",
     "run_extractor",
     "run_researcher",

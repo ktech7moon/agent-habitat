@@ -85,6 +85,7 @@ from ..state import (
     update_workflow,
 )
 from .models import (
+    Critique,
     Draft,
     DraftClaim,
     ScoredCompany,
@@ -172,7 +173,55 @@ OUTPUT RULES — these are not suggestions:
 """
 
 
-def _build_user_prompt(scored_company: ScoredCompany) -> str:
+RETRY_PROMPT_PREFACE = """PRIOR ATTEMPT WAS REJECTED BY THE FABRICATION CRITIC.
+
+A previous draft for this company FAILED the substring-grounding chain. The critic identified the failures below. You must produce a REVISED draft where every failing claim either (a) is dropped from the prose entirely, or (b) substring-matches its upstream evidence verbatim after whitespace+case normalisation.
+
+CRITICAL RULES FOR THE REVISION:
+
+  - For each failure classified "fixable_paraphrase": use the upstream quote VERBATIM in your prose, then enumerate the matching claim with claim.text drawn as a contiguous substring of that verbatim phrase. Do NOT paraphrase, do NOT drop corporate suffixes, do NOT substitute synonyms.
+  - For each failure classified "fabricated": REMOVE the claim entirely. The upstream evidence does not support it; you cannot fix it by rewording.
+  - Do NOT introduce NEW concrete claims that were not in the prior attempt — narrow the prose; do not broaden it.
+  - The revised prose still needs to read as a coherent outreach message; a shorter draft is better than a clever one.
+
+PRIOR CRITIQUE FAILURES (one entry per rejected claim):
+
+"""
+
+
+def _format_prior_critique(critique: Critique) -> str:
+    """Render the failed verdicts as a retry-prompt payload.
+
+    Only failed verdicts are surfaced; passed claims do not need attention
+    on retry. Each block names the claim text, the failed hop, the LLM-judged
+    classification, the upstream verbatim quote the Drafter should embed
+    (when one exists), and the critic's explanation.
+    """
+    blocks: list[str] = []
+    for i, v in enumerate(critique.verdicts):
+        if v.passed:
+            continue
+        upstream_block = (
+            f'  upstream verbatim quote to embed: "{v.upstream_quote}"\n'
+            if v.upstream_quote is not None
+            else "  upstream verbatim quote: (none — claim cannot be salvaged)\n"
+        )
+        blocks.append(
+            f"FAILURE {i + 1}:\n"
+            f'  rejected claim: "{v.claim_text}"\n'
+            f"  supporting_dimension: {v.supporting_dimension}\n"
+            f"  failed_hop: {v.failed_hop}\n"
+            f"  classification: {v.classification}\n"
+            f"{upstream_block}"
+            f"  critic explanation: {v.explanation}\n"
+        )
+    return "\n".join(blocks)
+
+
+def _build_user_prompt(
+    scored_company: ScoredCompany,
+    prior_critique: Critique | None = None,
+) -> str:
     """Assemble the per-dimension payload the LLM drafts against.
 
     Excluded dimensions are sent for context but explicitly marked as
@@ -180,6 +229,11 @@ def _build_user_prompt(scored_company: ScoredCompany) -> str:
     included even for excluded dimensions — an auditor reading the
     JSONL telemetry can see what the Drafter saw without resolving the
     ScoredCompany separately.
+
+    `prior_critique`, when supplied, prepends a RETRY_PROMPT_PREFACE plus
+    the per-failure rejection list — the Slice 7 bounded-retry signal
+    (ADR-006 §1). The prefix is structurally distinct from the dimension
+    payload so the model sees the retry context first and cannot miss it.
     """
     sections: list[str] = []
     for dim in scored_company.dimensions:
@@ -203,7 +257,13 @@ def _build_user_prompt(scored_company: ScoredCompany) -> str:
         f"{scored_company.score:.1f}/100" if scored_company.score is not None else "(no score)"
     )
     coverage_pct = scored_company.coverage * 100.0
+    retry_block = (
+        RETRY_PROMPT_PREFACE + _format_prior_critique(prior_critique) + "\n"
+        if prior_critique is not None
+        else ""
+    )
     return (
+        f"{retry_block}"
         f'Company: "{scored_company.company_name}"\n'
         f"Operator-internal context (do NOT include in prose): "
         f"score={score_str}, coverage={coverage_pct:.0f}%, tier={scored_company.tier}.\n\n"
@@ -363,6 +423,7 @@ def drafter_node(
     scored_company: ScoredCompany,
     workflow_id: str,
     log_root: Path | None = None,
+    prior_critique: Critique | None = None,
 ) -> DrafterNodeOutput:
     """Layer A: pure drafter logic.
 
@@ -370,6 +431,12 @@ def drafter_node(
     response into a `Draft`, runs the cross-input invariant check, and
     returns the typed `Draft` plus the telemetry the wrapper (or LangGraph
     orchestrator) records onto its step.
+
+    `prior_critique`, when supplied (Slice 7 bounded retry — ADR-006 §1),
+    prepends a retry preface + per-failure rejection list to the user
+    prompt so Opus sees the critic's findings before the dimension payload.
+    The kwarg is ADDITIVE: calls that omit it behave exactly as before
+    (Slice 5 test_drafter.py is the cross-check).
 
     Does NOT touch the database, does NOT call `run_step`, does NOT
     insert/update workflows. Parse / schema / cross-input failures raise
@@ -392,7 +459,12 @@ def drafter_node(
     company_name = scored_company.company_name
     llm_result = complete(
         model_tier=ModelTier.OPUS,
-        messages=[{"role": "user", "content": _build_user_prompt(scored_company)}],
+        messages=[
+            {
+                "role": "user",
+                "content": _build_user_prompt(scored_company, prior_critique=prior_critique),
+            }
+        ],
         workflow_id=workflow_id,
         agent_name=AGENT_NAME,
         system=SYSTEM_PROMPT,

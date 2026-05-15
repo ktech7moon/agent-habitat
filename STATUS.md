@@ -1,10 +1,12 @@
 # agent-habitat STATUS
 
 ## Current Phase
-Phase 1 — Habitat Infrastructure (full plan: docs/ROADMAP.md)
+Phase 2 — 5-Agent Lead Enrichment Crew (full plan: docs/ROADMAP.md)
 
 ## Current Slice
-Slice 7 — Multi-URL live calibration + Phase 1 README **— COMPLETE**. Phase 1 shippable.
+Phase 2 Slice 1 — Crew-architecture ADR **— COMPLETE** (ADR-006 accepted 2026-05-14).
+Phase 1 remains shippable; Slice 8 (optional Phase 1 polish) is queued separately
+and can be picked up anytime without blocking Phase 2.
 
 ## Slice 1 Subtasks
 - [x] Scaffold project skeleton + plan docs
@@ -107,7 +109,7 @@ Slice 7 calibration story / README:
 - **ADR-002 underspecification: orphan reconciliation target without LangGraph state.** ADR-002 says orphans reconcile to "failed with a synthesized event, or resume." The "or resume" branch needs LangGraph checkpoint state to decide whether resume is safe; that wiring lands with the Phase 2 orchestrator. Slice 2 implements the deterministic half: mark orphan FAILED, set `finished_at=now`, synthesize a WARN event. The resume branch can layer on top later without changing this contract.
 - **Slice 3 "daily" definition resolved: UTC calendar day.** "Daily budget cap" = the half-open interval `[today 00:00:00 UTC, tomorrow 00:00:00 UTC)`. Caps reset at UTC midnight. Why UTC over rolling-24h or local-tz: aligns with the JSONL telemetry directory layout (`data/logs/YYYY-MM-DD/` already UTC), is trivially auditable, and makes window queries simple ISO-string range comparisons. Revisit if a workload needs per-tenant local-tz semantics.
 - **`MAX_PROMPT_CHARS` truncation — visibility resolved; chunk-and-stitch still ADR-gated.** Visibility half RESOLVED (2026-05-14, post-Slice-7 surgical fix): `SummarizerResult` now carries `input_truncated` + `original_chars`/`used_chars`/`dropped_chars`, and the summarize step's `step.completed` event records the same keys additively in `structured_data` (only when truncation actually fired — no false-positive keys on under-limit input). Live-smoke confirmed on https://en.wikipedia.org/wiki/Anthropic: 45,079 → 12,000 chars, dropped 33,079, run still COMPLETED, signal visible end-to-end. Same instinct as `LLMResult.stop_reason` (Slice 2) applied to the INPUT side. What remains: whether to chunk-and-stitch (summarise sections, then summarise the summaries) so a heavy page is actually fully covered rather than just transparently truncated — that is a behaviour/cost change, ADR-worthy, and queued for the Phase 2 Slice 1 crew-architecture ADR. The MAX_PROMPT_CHARS *value* (12,000) is a separate tuning question; the visibility data this fix generates is what should inform it. Source: Slice 7 live calibration finding #1, recorded in README; visibility commit references this entry.
-- **Promote a habitat-level `run_step()` utility before Phase 2 agents are built (ADR-gated).** The URL summarizer's step-lifecycle code (`_run_step` / `_run_summarize_step` in `src/agent_habitat/agents/summarizer.py` — ~188 lines) implements the open-RUNNING-row → emit step.started → do work → close COMPLETED/FAILED → emit result-event sequence. Every Phase 2 agent (researcher, extractor, scorer, drafter, critic) needs this exact lifecycle. If each copies it, that is ~940 lines of duplicated boilerplate and five independent copies of the audit-grade guarantee that can drift. The fix is to promote a habitat-level `run_step()` utility that agents call instead of reimplementing — a new shared abstraction, so it is ADR-gated per Working Agreement rule 14. Decide it as part of (or alongside) the Phase 2 Slice 1 ADR, before Phase 2 agents are built. Source: the Slice 6 summarizer.py audit. A separate, smaller cleanup also rides along whenever `summarizer.py` is next rewritten: ~40-45 lines of cosmetic trim (over-long module docstring, five section dividers, WORKFLOW_TYPE/AGENT_NAME constants that could be literals) — not worth its own session, fold it into the `run_step` extraction diff.
+- **`run_step()` utility — design RESOLVED in ADR-006 §2; implementation queued for Phase 2 Slice 2.** ADR-006 commits to a context-manager utility at `src/agent_habitat/orchestration/run_step.py` (the package exists but is empty; this is its first occupant) with explicit `record_cost` / `record_output_ref` / `record_structured_data` verbs on a yielded `StepRecorder`. Lifecycle = open RUNNING step row → emit step.started → yield → finalise COMPLETED with the recorder's accumulated cost/output_ref/structured_data on normal exit; on exception, finalise FAILED with `error_message` + emit step.failed, re-raise. No LangGraph dependency in the utility — it stays a pure habitat audit-lifecycle primitive. Implementation lands alongside Phase 2 Slice 2 (Researcher) since the researcher is the first new agent to need it; the summarizer is retrofitted onto the same utility in that same diff (proving the contract serves both call sites) and the ~40-45 lines of cosmetic trim ride along. Source: ADR-006 §2; alternatives (callable-with-work-fn, decorator, BaseAgent class, orchestrator-injected hooks) all rejected with rationale in ADR-006's Alternatives D.
 
 ## Last Session
 Slice 7 — multi-URL live calibration + Phase 1 README. Ran the URL summarizer
@@ -219,25 +221,34 @@ Slice 3's actual new work (per the kickoff prompt) was the budget-check + halt-s
 Tests: 40 deterministic tests in `tests/test_budget.py` — pure evaluator across boundary/edge cases (zero cap, threshold=0, threshold=1, at-cap, at-threshold); UTC window correctness including tz conversion and naive-datetime defensive path; `cost_within_window` inclusion/exclusion at boundaries and isolation across workflows; end-to-end check with override resolution; exceed-event row shape; halt-signal query including the "unrelated error event must not trip the halt" anti-confusion case; TOML config loading including missing file, malformed TOML, missing required key, missing [defaults] section, override without `daily_cap_usd`, threshold out of range, and a sanity-check that the bundled `config/budgets.toml` loads. Full suite (90 tests including llm.py and state) passes cleanly. ruff check + ruff format + mypy strict all clean.
 
 ## Next Session Entry Point
-Phase 1 is shippable. Joseph's call between two next-session options:
+**Phase 2 Slice 2 — Researcher agent.** Fresh session, Opus high (slice
+implementation). Before any researcher code: write **ADR-003 (web search tool
+choice)** — Anthropic `web_search` vs Tavily vs Brave vs custom. ADR-003 is
+small (one decision, four options, ~one page) and blocks the researcher's
+external-call shape. After ADR-003 lands, build:
 
-**Option A — Slice 8 (optional Phase 1 polish).** Fresh session, Sonnet medium.
-Add the Mermaid architecture diagram, hiring-manager pass on the README (tone +
-density tightening), anonymous-friendly contact section, decide on the
-truncation-event Open Question (warning event vs ADR for chunk-and-stitch — the
-warning event is small and worth doing as part of polish; chunk-and-stitch is
-its own ADR and belongs to Phase 2 if at all). Light-code session.
+1. **`src/agent_habitat/orchestration/run_step.py`** — the context-manager
+   utility per ADR-006 §2: `run_step(conn, *, workflow_id, step_index,
+   agent_name, now=None)` yielding a `StepRecorder` with `record_cost` /
+   `record_output_ref` / `record_structured_data` verbs. Tests cover normal
+   exit (step row → COMPLETED + step.completed event with merged structured
+   data), exception exit (step row → FAILED + step.failed + re-raise), and
+   the no-cost / no-output_ref non-LLM step shape.
+2. **Retrofit the summarizer onto `run_step()`** in the same diff — proves
+   the contract serves a real existing agent. Fold in the ~40-45 lines of
+   cosmetic trim (over-long docstring, section dividers, WORKFLOW_TYPE
+   constants) noted in the (now-resolved) Open Question. Quality gates must
+   stay clean (175+ deterministic tests, ruff, mypy strict).
+3. **`src/agent_habitat/agents/researcher.py`** — `run_researcher(conn,
+   *, company_name, ...)` per ADR-006 §1 handoff contract. Builds
+   `RawSignals` Pydantic v2 model (signal records with text + source URL +
+   retrieved-at). One Haiku LLM call (per the model-routing table) summarising
+   per-signal relevance once the search tool returns. Mirror `{signal_count,
+   source_count}` onto `step.completed`. No LangGraph yet (that's Slice 6 —
+   the orchestrator). The researcher is callable as a standalone agent now;
+   the orchestrator will wrap it later.
 
-**Option B — Phase 2 Slice 1 (crew architecture ADR).** Fresh session, Opus
-xHigh. The ADR-gated decisions before any Phase 2 agent code: (1) which five
-agents, what handoffs (sequential vs parallel), shared-state shape, error/retry
-strategy; (2) whether to promote a habitat-level `run_step()` utility now
-(Open Question above — recommended bundled with this ADR, since every Phase 2
-agent needs the lifecycle); (3) ADR-003 web-search-tool choice for the
-researcher (Anthropic `web_search` tool vs Tavily vs Brave vs custom — decide
-before Slice 2). No Phase 2 implementation in this session; ADRs only,
-alternatives mandatory.
-
-Recommendation: **Option B**. The README is honest as-is, and the polish-pass
-quality bar makes more sense after Phase 2 lands real numbers from a non-toy
-workload. The Phase 2 Slice 1 ADR is the bigger blocker.
+Phase 2 Slice 1 (this session) is COMPLETE: ADR-006 sets the crew topology,
+the `run_step()` contract, and the fabrication-resistance contract (ADR-005
+folded in). Phase 1 Slice 8 (optional polish) remains available anytime and
+is not on the critical path.

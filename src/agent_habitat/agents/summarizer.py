@@ -1,37 +1,11 @@
 """URL summarizer demo agent — Phase 1 Slice 6.
 
-First end-to-end workload riding the habitat. Three synchronous steps:
+Three steps (fetch / parse / summarize) threaded through the habitat via
+run_step(): state.persistence, observability, llm.py, and budget tracking.
 
-  1. fetch     — httpx GET of the URL, with a size cap on the response body.
-  2. parse     — BeautifulSoup readable-text extraction (lean; no scrapy-grade
-                 boilerplate stripping).
-  3. summarize — `llm.complete()` (Sonnet tier) over the extracted text.
-
-The point of this slice is not the summarizer; the summarizer is the load.
-A single run exercises every Phase 1 habitat primitive:
-
-  - state.persistence  — workflow + step rows, lifecycle status transitions.
-  - observability      — `emit_event()` for workflow.started/completed/failed
-                         and step.started/completed/failed.
-  - llm.py             — every LLM call routes through `complete()`; the
-                         JSONL telemetry line is referenced from the
-                         summarize step's `output_ref`.
-  - budget             — the summarize step writes real `cost_usd`;
-                         `recompute_cost_total` rolls it up onto
-                         `workflows.cost_total_usd`, where the existing
-                         daily-cap query primitive can sum it.
-
-Explicitly out of scope (Phase 2):
-  - No LangGraph; the orchestrator does not exist yet.
-  - No checkpoint invocation; the summarizer has no flagged actions.
-  - No active budget enforcement; cost is *recorded* so the existing budget
-    primitives can find it. Halting on exceed is the orchestrator's job.
-
-Failure contract: any step error transitions the workflow to FAILED with
-`finished_at` stamped, emits a step.failed and workflow.failed event, and
-returns a `SummarizerResult` with `status=FAILED`. The run never crashes
-uncaught from the caller's perspective, and it never leaves a workflow
-stuck in RUNNING.
+Failure contract: any step error records a FAILED workflow with
+finished_at stamped, emits step.failed + workflow.failed, and returns
+SummarizerResult(status=FAILED). Never leaves a workflow stuck in RUNNING.
 """
 
 from __future__ import annotations
@@ -41,39 +15,24 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TypeVar
-
 import httpx
 import structlog
 from bs4 import BeautifulSoup
 
 from ..llm import ModelTier, complete
 from ..observability import EventType, emit_event
+from ..orchestration.run_step import run_step
 from ..state import (
     EventLevel,
-    StepStatus,
     Workflow,
     WorkflowStatus,
-    WorkflowStep,
-    insert_step,
     insert_workflow,
     new_workflow_id,
     recompute_cost_total,
-    update_step,
     update_workflow,
 )
 
 log = structlog.get_logger(__name__)
-
-_T = TypeVar("_T")
-
-
-# ---------------------------------------------------------------------------
-# Constants — tuning surface for the agent without touching call sites.
-# ---------------------------------------------------------------------------
-
-WORKFLOW_TYPE = "url_summarizer"
-AGENT_NAME = "url_summarizer"
 
 #: Max bytes of HTTP response body we will download before bailing out.
 #: A 1 MB cap is comfortable headroom for normal web pages and a hard stop
@@ -109,11 +68,6 @@ SYSTEM_PROMPT = (
     "infer beyond the text. If the page is essentially empty or unintelligible, "
     "say so in one sentence."
 )
-
-
-# ---------------------------------------------------------------------------
-# Result contract
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -162,11 +116,6 @@ class SummarizerError(Exception):
         super().__init__(message)
         self.step_name = step_name
         self.message = message
-
-
-# ---------------------------------------------------------------------------
-# Step 1: fetch
-# ---------------------------------------------------------------------------
 
 
 def fetch_url(url: str, *, http_client: httpx.Client | None = None) -> str:
@@ -219,11 +168,6 @@ def fetch_url(url: str, *, http_client: httpx.Client | None = None) -> str:
             client.close()
 
 
-# ---------------------------------------------------------------------------
-# Step 2: parse
-# ---------------------------------------------------------------------------
-
-
 def extract_readable_text(html: str) -> str:
     """Pull readable text from HTML; lean approach, not scrapy-grade.
 
@@ -261,11 +205,6 @@ def extract_readable_text(html: str) -> str:
     return cleaned
 
 
-# ---------------------------------------------------------------------------
-# Orchestration — wire the three steps through the habitat
-# ---------------------------------------------------------------------------
-
-
 def _utcnow() -> datetime:
     return datetime.now(UTC)
 
@@ -299,7 +238,7 @@ def run_summarizer(
 
     workflow = Workflow(
         id=wf_id,
-        workflow_type=WORKFLOW_TYPE,
+        workflow_type="url_summarizer",
         status=WorkflowStatus.RUNNING,
         started_at=clock().isoformat(),
         metadata={"url": url},
@@ -311,43 +250,71 @@ def run_summarizer(
         event_type=EventType.WORKFLOW_STARTED,
         level=EventLevel.INFO,
         message=f"url_summarizer workflow started for {url}",
-        structured_data={"url": url, "workflow_type": WORKFLOW_TYPE},
+        structured_data={"url": url, "workflow_type": "url_summarizer"},
         timestamp=clock(),
     )
-
     log.info("summarizer.run.start", workflow_id=wf_id, url=url)
 
+    summary: str | None = None
+    llm_ref = ""
+    truncation = _TruncationInfo(truncated=False, original_chars=0, used_chars=0, dropped_chars=0)
+    html = ""
+    readable = ""
+
     try:
-        html = _run_step(
-            conn,
-            workflow_id=wf_id,
-            step_index=1,
-            step_name="fetch",
-            now=clock,
-            work=lambda: fetch_url(url, http_client=http_client),
-        )
+        with run_step(conn, workflow_id=wf_id, step_index=1, agent_name="fetch", now=clock):
+            html = fetch_url(url, http_client=http_client)
 
-        readable = _run_step(
-            conn,
-            workflow_id=wf_id,
-            step_index=2,
-            step_name="parse",
-            now=clock,
-            work=lambda: extract_readable_text(html),
-        )
+        with run_step(conn, workflow_id=wf_id, step_index=2, agent_name="parse", now=clock):
+            readable = extract_readable_text(html)
 
-        summary, llm_cost, llm_ref, truncation = _run_summarize_step(
-            conn,
-            workflow_id=wf_id,
-            step_index=3,
-            readable_text=readable,
-            log_root=log_root,
-            now=clock,
-        )
+        with run_step(
+            conn, workflow_id=wf_id, step_index=3, agent_name="summarize", now=clock
+        ) as step:
+            original_chars = len(readable)
+            used_chars = min(original_chars, MAX_PROMPT_CHARS)
+            dropped_chars = original_chars - used_chars
+            truncation = _TruncationInfo(
+                truncated=dropped_chars > 0,
+                original_chars=original_chars,
+                used_chars=used_chars,
+                dropped_chars=dropped_chars,
+            )
+            try:
+                llm_result = complete(
+                    model_tier=ModelTier.SONNET,
+                    messages=[{"role": "user", "content": readable[:MAX_PROMPT_CHARS]}],
+                    workflow_id=wf_id,
+                    agent_name="url_summarizer",
+                    system=SYSTEM_PROMPT,
+                    max_tokens=SUMMARIZE_MAX_TOKENS,
+                    log_root=log_root,
+                )
+            except Exception as exc:
+                raise SummarizerError("summarize", f"{type(exc).__name__}: {exc}") from exc
+
+            step.record_cost(llm_result.cost_usd)
+            step.record_output_ref(llm_result.jsonl_ref)
+            step.record_structured_data(
+                {
+                    "input_tokens": llm_result.input_tokens,
+                    "output_tokens": llm_result.output_tokens,
+                    "truncated": llm_result.truncated,
+                }
+            )
+            if truncation.truncated:
+                step.record_structured_data(
+                    {
+                        "input_truncated": True,
+                        "original_chars": truncation.original_chars,
+                        "used_chars": truncation.used_chars,
+                        "dropped_chars": truncation.dropped_chars,
+                    }
+                )
+            summary = llm_result.content.strip()
+            llm_ref = llm_result.jsonl_ref
 
     except SummarizerError as exc:
-        # Step row + step.failed event have already been written by the step
-        # helper. Close out the workflow.
         finished = clock().isoformat()
         updated = workflow.model_copy(
             update={"status": WorkflowStatus.FAILED, "finished_at": finished}
@@ -422,223 +389,3 @@ def run_summarizer(
         used_chars=truncation.used_chars,
         dropped_chars=truncation.dropped_chars,
     )
-
-
-# ---------------------------------------------------------------------------
-# Step helpers
-# ---------------------------------------------------------------------------
-
-
-def _run_step(
-    conn: sqlite3.Connection,
-    *,
-    workflow_id: str,
-    step_index: int,
-    step_name: str,
-    now: Callable[[], datetime],
-    work: Callable[[], _T],
-) -> _T:
-    """Run a non-LLM step: insert RUNNING row, emit step.started, do work,
-    finalize the row + emit step.completed/failed.
-
-    Raises `SummarizerError` for `work` failures after persisting the
-    FAILED step + step.failed event.
-    """
-    started = now().isoformat()
-    step = WorkflowStep(
-        workflow_id=workflow_id,
-        step_index=step_index,
-        agent_name=step_name,
-        status=StepStatus.RUNNING,
-        started_at=started,
-    )
-    insert_step(conn, step)
-    emit_event(
-        conn,
-        workflow_id=workflow_id,
-        event_type=EventType.STEP_STARTED,
-        level=EventLevel.INFO,
-        message=f"step started: {step_name}",
-        structured_data={"step_name": step_name, "step_index": step_index},
-        step_id=step.id,
-        timestamp=now(),
-    )
-
-    try:
-        result = work()
-    except SummarizerError as exc:
-        finished_at = now().isoformat()
-        update_step(
-            conn,
-            step.model_copy(
-                update={
-                    "status": StepStatus.FAILED,
-                    "finished_at": finished_at,
-                    "error_message": exc.message,
-                }
-            ),
-        )
-        emit_event(
-            conn,
-            workflow_id=workflow_id,
-            event_type=EventType.STEP_FAILED,
-            level=EventLevel.ERROR,
-            message=f"step failed: {step_name}: {exc.message}",
-            structured_data={
-                "step_name": step_name,
-                "step_index": step_index,
-                "error": exc.message,
-            },
-            step_id=step.id,
-            timestamp=now(),
-        )
-        raise
-
-    finished_at = now().isoformat()
-    update_step(
-        conn,
-        step.model_copy(update={"status": StepStatus.COMPLETED, "finished_at": finished_at}),
-    )
-    emit_event(
-        conn,
-        workflow_id=workflow_id,
-        event_type=EventType.STEP_COMPLETED,
-        level=EventLevel.INFO,
-        message=f"step completed: {step_name}",
-        structured_data={"step_name": step_name, "step_index": step_index},
-        step_id=step.id,
-        timestamp=now(),
-    )
-    return result
-
-
-def _run_summarize_step(
-    conn: sqlite3.Connection,
-    *,
-    workflow_id: str,
-    step_index: int,
-    readable_text: str,
-    log_root: Path | None,
-    now: Callable[[], datetime],
-) -> tuple[str, float, str, _TruncationInfo]:
-    """The LLM-bearing step. Records `cost_usd` + `output_ref` onto the row.
-
-    Returns `(summary, cost_usd, jsonl_ref, truncation)`. Raises
-    `SummarizerError("summarize", ...)` on any LLM/API exception, after
-    persisting the FAILED step + event. When the readable text exceeds
-    `MAX_PROMPT_CHARS` the truncation is detected, surfaced on the returned
-    `_TruncationInfo`, and recorded additively on the step.completed event's
-    `structured_data` (input_truncated / original_chars / used_chars /
-    dropped_chars) so the audit trail no longer hides the fact that the LLM
-    saw only a prefix of the page.
-    """
-    started = now().isoformat()
-    step = WorkflowStep(
-        workflow_id=workflow_id,
-        step_index=step_index,
-        agent_name="summarize",
-        status=StepStatus.RUNNING,
-        started_at=started,
-    )
-    insert_step(conn, step)
-    emit_event(
-        conn,
-        workflow_id=workflow_id,
-        event_type=EventType.STEP_STARTED,
-        level=EventLevel.INFO,
-        message="step started: summarize",
-        structured_data={"step_name": "summarize", "step_index": step_index},
-        step_id=step.id,
-        timestamp=now(),
-    )
-
-    original_chars = len(readable_text)
-    used_chars = min(original_chars, MAX_PROMPT_CHARS)
-    dropped_chars = original_chars - used_chars
-    truncation = _TruncationInfo(
-        truncated=dropped_chars > 0,
-        original_chars=original_chars,
-        used_chars=used_chars,
-        dropped_chars=dropped_chars,
-    )
-    prompt_text = readable_text[:MAX_PROMPT_CHARS]
-
-    try:
-        result = complete(
-            model_tier=ModelTier.SONNET,
-            messages=[{"role": "user", "content": prompt_text}],
-            workflow_id=workflow_id,
-            agent_name=AGENT_NAME,
-            system=SYSTEM_PROMPT,
-            max_tokens=SUMMARIZE_MAX_TOKENS,
-            log_root=log_root,
-        )
-    except Exception as exc:
-        finished_at = now().isoformat()
-        message = f"{type(exc).__name__}: {exc}"
-        update_step(
-            conn,
-            step.model_copy(
-                update={
-                    "status": StepStatus.FAILED,
-                    "finished_at": finished_at,
-                    "error_message": message,
-                }
-            ),
-        )
-        emit_event(
-            conn,
-            workflow_id=workflow_id,
-            event_type=EventType.STEP_FAILED,
-            level=EventLevel.ERROR,
-            message=f"step failed: summarize: {message}",
-            structured_data={
-                "step_name": "summarize",
-                "step_index": step_index,
-                "error": message,
-            },
-            step_id=step.id,
-            timestamp=now(),
-        )
-        raise SummarizerError("summarize", message) from exc
-
-    finished_at = now().isoformat()
-    update_step(
-        conn,
-        step.model_copy(
-            update={
-                "status": StepStatus.COMPLETED,
-                "finished_at": finished_at,
-                "output_ref": result.jsonl_ref,
-                "cost_usd": result.cost_usd,
-            }
-        ),
-    )
-    structured_data: dict[str, Any] = {
-        "step_name": "summarize",
-        "step_index": step_index,
-        "cost_usd": result.cost_usd,
-        "output_ref": result.jsonl_ref,
-        "input_tokens": result.input_tokens,
-        "output_tokens": result.output_tokens,
-        "truncated": result.truncated,
-    }
-    if truncation.truncated:
-        # Additive: only stamped when truncation actually happened, so an
-        # under-limit run records no false-positive truncation keys.
-        structured_data["input_truncated"] = True
-        structured_data["original_chars"] = truncation.original_chars
-        structured_data["used_chars"] = truncation.used_chars
-        structured_data["dropped_chars"] = truncation.dropped_chars
-    emit_event(
-        conn,
-        workflow_id=workflow_id,
-        event_type=EventType.STEP_COMPLETED,
-        level=EventLevel.INFO,
-        message="step completed: summarize",
-        structured_data=structured_data,
-        step_id=step.id,
-        timestamp=now(),
-    )
-
-    return result.content.strip(), result.cost_usd, result.jsonl_ref, truncation

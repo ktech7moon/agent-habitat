@@ -111,9 +111,37 @@ Slice 7 calibration story / README:
 - **ADR-002 underspecification: orphan reconciliation target without LangGraph state.** ADR-002 says orphans reconcile to "failed with a synthesized event, or resume." The "or resume" branch needs LangGraph checkpoint state to decide whether resume is safe; that wiring lands with the Phase 2 orchestrator. Slice 2 implements the deterministic half: mark orphan FAILED, set `finished_at=now`, synthesize a WARN event. The resume branch can layer on top later without changing this contract.
 - **Slice 3 "daily" definition resolved: UTC calendar day.** "Daily budget cap" = the half-open interval `[today 00:00:00 UTC, tomorrow 00:00:00 UTC)`. Caps reset at UTC midnight. Why UTC over rolling-24h or local-tz: aligns with the JSONL telemetry directory layout (`data/logs/YYYY-MM-DD/` already UTC), is trivially auditable, and makes window queries simple ISO-string range comparisons. Revisit if a workload needs per-tenant local-tz semantics.
 - **`MAX_PROMPT_CHARS` truncation — visibility resolved; chunk-and-stitch still ADR-gated.** Visibility half RESOLVED (2026-05-14, post-Slice-7 surgical fix): `SummarizerResult` now carries `input_truncated` + `original_chars`/`used_chars`/`dropped_chars`, and the summarize step's `step.completed` event records the same keys additively in `structured_data` (only when truncation actually fired — no false-positive keys on under-limit input). Live-smoke confirmed on https://en.wikipedia.org/wiki/Anthropic: 45,079 → 12,000 chars, dropped 33,079, run still COMPLETED, signal visible end-to-end. Same instinct as `LLMResult.stop_reason` (Slice 2) applied to the INPUT side. What remains: whether to chunk-and-stitch (summarise sections, then summarise the summaries) so a heavy page is actually fully covered rather than just transparently truncated — that is a behaviour/cost change, ADR-worthy, and queued for the Phase 2 Slice 1 crew-architecture ADR. The MAX_PROMPT_CHARS *value* (12,000) is a separate tuning question; the visibility data this fix generates is what should inform it. Source: Slice 7 live calibration finding #1, recorded in README; visibility commit references this entry.
-- **`run_step()` utility — design RESOLVED in ADR-006 §2; implementation queued for Phase 2 Slice 2.** ADR-006 commits to a context-manager utility at `src/agent_habitat/orchestration/run_step.py` (the package exists but is empty; this is its first occupant) with explicit `record_cost` / `record_output_ref` / `record_structured_data` verbs on a yielded `StepRecorder`. Lifecycle = open RUNNING step row → emit step.started → yield → finalise COMPLETED with the recorder's accumulated cost/output_ref/structured_data on normal exit; on exception, finalise FAILED with `error_message` + emit step.failed, re-raise. No LangGraph dependency in the utility — it stays a pure habitat audit-lifecycle primitive. Implementation lands alongside Phase 2 Slice 2 (Researcher) since the researcher is the first new agent to need it; the summarizer is retrofitted onto the same utility in that same diff (proving the contract serves both call sites) and the ~40-45 lines of cosmetic trim ride along. Source: ADR-006 §2; alternatives (callable-with-work-fn, decorator, BaseAgent class, orchestrator-injected hooks) all rejected with rationale in ADR-006's Alternatives D.
+- **`run_step()` utility — IMPLEMENTED 2026-05-14.** `src/agent_habitat/orchestration/run_step.py` ships the `StepRecorder` dataclass + `run_step()` context manager exactly per ADR-006 §2. Summarizer retrofitted onto it in the same commit; 20 deterministic tests in `tests/test_run_step.py`; all 196 deterministic tests pass; live smoke confirmed. Cosmetic trim (docstring, section dividers, WORKFLOW_TYPE/AGENT_NAME inlined) rode along. summarizer.py: 645 → 391 lines.
 
 ## Last Session
+Phase 2 Slice 2 (partial) — `run_step()` extraction + summarizer retrofit.
+
+Extracted `src/agent_habitat/orchestration/run_step.py` as the shared step
+lifecycle context manager per ADR-006 §2. `StepRecorder` dataclass yields from
+`run_step()` with three recording verbs (`record_cost`, `record_output_ref`,
+`record_structured_data` — additive, last-write-wins). Lifecycle contract:
+open RUNNING step row → emit step.started → yield recorder → on normal exit
+finalise COMPLETED with accumulated values and emit step.completed (standard
+keys: step_name, step_index, cost_usd, output_ref when present, merged with
+recorder's structured_data); on exception finalise FAILED with
+`error_message=f"{type(exc).__name__}: {exc}"`, emit step.failed, re-raise.
+No LangGraph dependency. 20 new deterministic tests in `tests/test_run_step.py`
+cover all three branches (normal, exception, recorder verbs).
+
+Retrofitted `src/agent_habitat/agents/summarizer.py` onto the new utility.
+`_run_step` / `_run_summarize_step` (~188 lines) collapsed into three `with
+run_step(...)` blocks (~40 lines). Cosmetic trim rode along: module docstring
+trimmed from 35 → 8 lines; 6 section dividers removed; WORKFLOW_TYPE /
+AGENT_NAME inlined as literal strings; `agents/__init__.py` updated to drop the
+now-absent re-exports. summarizer.py: 645 → 391 lines (-254 lines, -39%).
+
+All 28 existing summarizer tests pass UNCHANGED — proving the retrofit preserved
+behaviour. Live smoke against https://example.com/ completed in 2.91s,
+cost=$0.001257, full audit chain (workflow → step → JSONL telemetry) resolves
+end-to-end via the retrofitted path. Full suite: 196 deterministic tests pass;
+ruff check + ruff format + mypy strict all clean.
+
+## Prior Session (ADR-003)
 ADR-003 — web search tool for the Researcher agent. Chose **Anthropic's built-in
 `web_search` server-side tool**, enabled on the Researcher's single Haiku call
 through `llm.py`. Three alternatives considered at their best and rejected for
@@ -263,45 +291,23 @@ Slice 3's actual new work (per the kickoff prompt) was the budget-check + halt-s
 Tests: 40 deterministic tests in `tests/test_budget.py` — pure evaluator across boundary/edge cases (zero cap, threshold=0, threshold=1, at-cap, at-threshold); UTC window correctness including tz conversion and naive-datetime defensive path; `cost_within_window` inclusion/exclusion at boundaries and isolation across workflows; end-to-end check with override resolution; exceed-event row shape; halt-signal query including the "unrelated error event must not trip the halt" anti-confusion case; TOML config loading including missing file, malformed TOML, missing required key, missing [defaults] section, override without `daily_cap_usd`, threshold out of range, and a sanity-check that the bundled `config/budgets.toml` loads. Full suite (90 tests including llm.py and state) passes cleanly. ruff check + ruff format + mypy strict all clean.
 
 ## Next Session Entry Point
-**Phase 2 Slice 2 — Researcher agent.** Fresh session, Opus high (slice
-implementation). ADR-003 is now accepted: the Researcher uses Anthropic's
-server-side `web_search` tool routed through `llm.py`, with the per-search fee
-aggregated into `LLMResult.cost_usd` and `search_result` content blocks
-captured verbatim into `RawSignals`. Build, in order:
+**Phase 2 Slice 2 (remainder) — Researcher agent + llm.py tools= passthrough +
+RawSignals model.** Fresh session, Opus high (slice implementation). ADR-003 is
+accepted; `run_step()` is done; the summarizer retrofit is done. Build:
 
-1. **`src/agent_habitat/orchestration/run_step.py`** — the context-manager
-   utility per ADR-006 §2: `run_step(conn, *, workflow_id, step_index,
-   agent_name, now=None)` yielding a `StepRecorder` with `record_cost` /
-   `record_output_ref` / `record_structured_data` verbs. Tests cover normal
-   exit (step row → COMPLETED + step.completed event with merged structured
-   data), exception exit (step row → FAILED + step.failed + re-raise), and
-   the no-cost / no-output_ref non-LLM step shape.
-2. **Retrofit the summarizer onto `run_step()`** in the same diff — proves
-   the contract serves a real existing agent. Fold in the ~40-45 lines of
-   cosmetic trim (over-long docstring, section dividers, WORKFLOW_TYPE
-   constants) noted in the (now-resolved) Open Question. Quality gates must
-   stay clean (175+ deterministic tests, ruff, mypy strict).
-3. **`src/agent_habitat/agents/researcher.py`** — `run_researcher(conn,
-   *, company_name, ...)` per ADR-006 §1 handoff contract and ADR-003's
-   tool decision. Concrete shape:
-   - Extend `llm.complete()` with a `tools=` passthrough (forwarded to
-     `messages.create`); extend `compute_cost_usd` to add `num_web_searches *
-     $0.01` onto `cost_usd`; add `web_searches` + `web_search_fee_usd`
-     additive keys to the JSONL telemetry record. Stamp the per-search rate
-     constant in `llm.py` with a verify-against-public-pricing date.
-   - Build the `RawSignals` Pydantic v2 model: each `Signal` carries
-     `text: str` + `source_url: str` + `retrieved_at: datetime`. Construct
-     signals **directly from `search_result` content blocks** in the response
-     — NOT from the model's narrative text. The block text is what the
-     fabrication-resistance substring check (ADR-006 §3) will ground against.
-   - One Haiku call (per the model-routing table) with
-     `tools=[{"type": "web_search_*", "max_uses": N}]`. Mirror
-     `{signal_count, source_count, web_searches}` onto `step.completed`.
-   - No LangGraph yet (that's Slice 6 — the orchestrator). The researcher is
-     callable as a standalone agent now; the orchestrator will wrap it later.
+1. **Extend `llm.complete()` with a `tools=` passthrough** — forwarded to
+   `messages.create`; extend `compute_cost_usd` to add
+   `num_web_searches * $0.01` onto `cost_usd`; add additive `web_searches` /
+   `web_search_fee_usd` keys to the JSONL telemetry record. Stamp the
+   per-search rate constant with a verify-against-public-pricing date.
+2. **`RawSignals` Pydantic v2 model** — each `Signal` carries `text: str` +
+   `source_url: str` + `retrieved_at: datetime`. Construct signals directly
+   from `search_result` content blocks in the API response, NOT from the
+   model's narrative text (fabrication-resistance grounding invariant per
+   ADR-006 §3).
+3. **`src/agent_habitat/agents/researcher.py`** — `run_researcher(conn, *,
+   company_name, ...)` via `run_step()`, one Haiku call with
+   `tools=[web_search]`, mirror `{signal_count, source_count, web_searches}`
+   onto `step.completed`. Standalone callable; LangGraph wiring is Slice 6.
 
-Phase 2 Slice 1 is COMPLETE (ADR-006 sets the crew topology, the `run_step()`
-contract, and the fabrication-resistance contract — ADR-005 folded in).
-ADR-003 (this session) closes the last blueprint gap before Phase 2 Slice 2.
-Phase 1 Slice 8 (optional polish) remains available anytime and is not on the
-critical path.
+`run_step()` and the summarizer retrofit are DONE. No re-work needed there.

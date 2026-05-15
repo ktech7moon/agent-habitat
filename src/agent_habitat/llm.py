@@ -18,13 +18,23 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import structlog
-from anthropic import Anthropic
+from anthropic import (
+    Anthropic,
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    InternalServerError,
+    RateLimitError,
+)
 from anthropic.types import (
     CitationsWebSearchResultLocation,
     MessageParam,
@@ -243,6 +253,105 @@ def _append_telemetry(path: Path, record: dict[str, Any]) -> int:
     return new_line_no
 
 
+# ---------------------------------------------------------------------------
+# Retry policy — ADR-007.
+#
+# Three attempts total (1 initial + 2 retries); exponential backoff with
+# jitter (1s, 2s) plus uniform [0, 0.5)s; Retry-After honoured on 429s.
+# Retryable classes: RateLimitError, InternalServerError, APIConnectionError,
+# APITimeoutError, and APIStatusError with status in {500, 502, 503, 504}.
+# Everything else surfaces unmodified. See docs/adr/ADR-007 for full rationale.
+# ---------------------------------------------------------------------------
+
+_RETRY_MAX_ATTEMPTS: int = 3
+_RETRY_BACKOFF_BASE_SECONDS: float = 1.0
+_RETRY_BACKOFF_FACTOR: float = 2.0
+_RETRY_BACKOFF_JITTER_SECONDS: float = 0.5
+_RETRYABLE_HTTP_STATUSES: frozenset[int] = frozenset({500, 502, 503, 504})
+
+#: Injectable sleeper / rng — module-level so tests can patch them via
+#: ``patch.object(llm, "_SLEEPER", lambda s: None)`` to make retry behaviour
+#: deterministic without real wall-clock waits.
+_SLEEPER: Callable[[float], None] = time.sleep
+_RNG: random.Random = random.Random()
+
+T = TypeVar("T")
+
+
+def _is_retryable_error(exc: BaseException) -> bool:
+    """ADR-007 §1: which exception classes earn a retry."""
+    if isinstance(exc, RateLimitError | InternalServerError | APIConnectionError | APITimeoutError):
+        return True
+    if isinstance(exc, APIStatusError):
+        return exc.status_code in _RETRYABLE_HTTP_STATUSES
+    return False
+
+
+def _retry_after_seconds(exc: BaseException) -> float | None:
+    """Honour Retry-After header on 429s when present (ADR-007 §3)."""
+    if not isinstance(exc, RateLimitError):
+        return None
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    header = headers.get("retry-after")
+    if header is None:
+        return None
+    try:
+        return float(header)
+    except (ValueError, TypeError):
+        return None
+
+
+def _backoff_seconds(attempt: int, rng: random.Random) -> float:
+    """attempt is 1-indexed; sleeps AFTER attempt N's failure, before attempt N+1."""
+    exp = _RETRY_BACKOFF_BASE_SECONDS * (_RETRY_BACKOFF_FACTOR ** (attempt - 1))
+    jitter = rng.uniform(0.0, _RETRY_BACKOFF_JITTER_SECONDS)
+    return exp + jitter
+
+
+def _call_with_retry(
+    fn: Callable[[], T],
+    *,
+    sleeper: Callable[[float], None] | None = None,
+    rng: random.Random | None = None,
+    max_attempts: int = _RETRY_MAX_ATTEMPTS,
+) -> tuple[T, int]:
+    """Run ``fn()`` with bounded retry per ADR-007. Returns ``(result, attempts)``.
+
+    On a non-retryable error: re-raises immediately. On retry budget
+    exhaustion: re-raises the last error. The sleeper and rng injectables
+    default to module-level ``_SLEEPER`` / ``_RNG`` so tests can patch
+    them via ``patch.object``.
+    """
+    s = sleeper if sleeper is not None else _SLEEPER
+    r = rng if rng is not None else _RNG
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn(), attempt
+        except Exception as exc:
+            if not _is_retryable_error(exc):
+                raise
+            if attempt == max_attempts:
+                raise
+            wait = _retry_after_seconds(exc)
+            if wait is None:
+                wait = _backoff_seconds(attempt, r)
+            log.warning(
+                "llm.call.retry",
+                attempt=attempt,
+                max_attempts=max_attempts,
+                wait_seconds=wait,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            s(wait)
+    # Loop exhaustion always re-raises in the body above; this is unreachable.
+    raise RuntimeError("retry loop exited without result or exception")  # pragma: no cover
+
+
 _client: Anthropic | None = None
 
 
@@ -344,7 +453,7 @@ def complete(
         kwargs["tools"] = tools
 
     try:
-        response = client.messages.create(**kwargs)
+        response, attempts = _call_with_retry(lambda: client.messages.create(**kwargs))
     except Exception:
         log.exception(
             "llm.call.failed",
@@ -384,6 +493,10 @@ def complete(
         "stop_reason": stop_reason,
         "response_text": content,
     }
+    if attempts > 1:
+        # ADR-007 §5: additive telemetry key; absent when no retries fired
+        # so the record shape is unchanged on the happy path.
+        record["attempts"] = attempts
     if tools is not None:
         # Additive keys — only present when the call actually used tools.
         # Ordinary no-tools calls keep their record shape unchanged.
@@ -402,6 +515,7 @@ def complete(
         jsonl_ref=jsonl_ref,
         web_searches=web_searches,
         citation_count=len(citations),
+        attempts=attempts,
     )
 
     return LLMResult(

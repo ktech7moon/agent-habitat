@@ -22,7 +22,11 @@ from agent_habitat.llm import (
     LLMResult,
     ModelTier,
     _append_telemetry,
+    _backoff_seconds,
+    _call_with_retry,
     _extract_web_search_citations,
+    _is_retryable_error,
+    _retry_after_seconds,
     _telemetry_path,
     _web_search_request_count,
     complete,
@@ -481,6 +485,289 @@ class TestCompleteToolsPassthrough:
         # And the LLMResult fields default cleanly.
         assert result.web_searches == 0
         assert result.citations == []
+
+
+# ---------------------------------------------------------------------------
+# Retry / backoff helper — ADR-007. Deterministic via injected sleeper + rng.
+# ---------------------------------------------------------------------------
+
+
+import random as _random  # noqa: E402
+
+import httpx  # noqa: E402
+from anthropic import (  # noqa: E402
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    BadRequestError,
+    InternalServerError,
+    RateLimitError,
+)
+
+
+def _httpx_response(status: int, *, headers: dict[str, str] | None = None) -> httpx.Response:
+    req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    return httpx.Response(status, request=req, headers=headers or {})
+
+
+def _httpx_request() -> httpx.Request:
+    return httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+
+
+class TestIsRetryableError:
+    """ADR-007 §1: which exception classes earn a retry."""
+
+    def test_rate_limit_is_retryable(self) -> None:
+        e = RateLimitError(message="slow", response=_httpx_response(429), body=None)
+        assert _is_retryable_error(e) is True
+
+    def test_internal_server_error_is_retryable(self) -> None:
+        e = InternalServerError(message="boom", response=_httpx_response(500), body=None)
+        assert _is_retryable_error(e) is True
+
+    def test_connection_error_is_retryable(self) -> None:
+        e = APIConnectionError(request=_httpx_request())
+        assert _is_retryable_error(e) is True
+
+    def test_timeout_is_retryable(self) -> None:
+        e = APITimeoutError(request=_httpx_request())
+        assert _is_retryable_error(e) is True
+
+    def test_502_503_504_are_retryable(self) -> None:
+        for status in (502, 503, 504):
+            e = APIStatusError(message="x", response=_httpx_response(status), body=None)
+            assert _is_retryable_error(e) is True, f"status {status} should be retryable"
+
+    def test_bad_request_is_not_retryable(self) -> None:
+        e = BadRequestError(message="bad", response=_httpx_response(400), body=None)
+        assert _is_retryable_error(e) is False
+
+    def test_404_not_retryable(self) -> None:
+        e = APIStatusError(message="x", response=_httpx_response(404), body=None)
+        assert _is_retryable_error(e) is False
+
+    def test_plain_value_error_not_retryable(self) -> None:
+        assert _is_retryable_error(ValueError("our own bug")) is False
+
+
+class TestRetryAfterSeconds:
+    def test_header_present(self) -> None:
+        e = RateLimitError(
+            message="slow",
+            response=_httpx_response(429, headers={"retry-after": "12"}),
+            body=None,
+        )
+        assert _retry_after_seconds(e) == pytest.approx(12.0)
+
+    def test_header_absent(self) -> None:
+        e = RateLimitError(message="slow", response=_httpx_response(429), body=None)
+        assert _retry_after_seconds(e) is None
+
+    def test_header_garbage_returns_none(self) -> None:
+        e = RateLimitError(
+            message="slow",
+            response=_httpx_response(429, headers={"retry-after": "soon"}),
+            body=None,
+        )
+        assert _retry_after_seconds(e) is None
+
+    def test_non_429_returns_none(self) -> None:
+        e = InternalServerError(message="boom", response=_httpx_response(500), body=None)
+        assert _retry_after_seconds(e) is None
+
+
+class TestBackoffSeconds:
+    def test_first_retry_is_about_one_second(self) -> None:
+        # attempt=1 → 1.0 * 2^0 + jitter[0, 0.5) ∈ [1.0, 1.5)
+        rng = _random.Random(0)
+        sleeps = [_backoff_seconds(1, rng) for _ in range(20)]
+        assert all(1.0 <= s < 1.5 for s in sleeps)
+
+    def test_second_retry_is_about_two_seconds(self) -> None:
+        # attempt=2 → 1.0 * 2^1 + jitter[0, 0.5) ∈ [2.0, 2.5)
+        rng = _random.Random(0)
+        sleeps = [_backoff_seconds(2, rng) for _ in range(20)]
+        assert all(2.0 <= s < 2.5 for s in sleeps)
+
+
+class TestCallWithRetry:
+    """The bounded-retry loop itself — sleeper + rng injected so tests are deterministic."""
+
+    def test_success_on_first_attempt_returns_result_attempts_1(self) -> None:
+        sleeps: list[float] = []
+        result, attempts = _call_with_retry(
+            lambda: "ok",
+            sleeper=sleeps.append,
+            rng=_random.Random(0),
+        )
+        assert result == "ok"
+        assert attempts == 1
+        assert sleeps == []  # No retries → no sleeps.
+
+    def test_retryable_then_success_returns_eventual_success(self) -> None:
+        sleeps: list[float] = []
+        calls = {"n": 0}
+
+        def fn() -> str:
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise InternalServerError(message="boom", response=_httpx_response(500), body=None)
+            return "ok"
+
+        result, attempts = _call_with_retry(fn, sleeper=sleeps.append, rng=_random.Random(0))
+        assert result == "ok"
+        assert attempts == 3
+        assert len(sleeps) == 2  # Two retries → two sleeps.
+        # First backoff ≈ 1s, second ≈ 2s (with jitter).
+        assert 1.0 <= sleeps[0] < 1.5
+        assert 2.0 <= sleeps[1] < 2.5
+
+    def test_non_retryable_raises_immediately_no_sleeps(self) -> None:
+        sleeps: list[float] = []
+        calls = {"n": 0}
+
+        def fn() -> str:
+            calls["n"] += 1
+            raise BadRequestError(message="bad", response=_httpx_response(400), body=None)
+
+        with pytest.raises(BadRequestError):
+            _call_with_retry(fn, sleeper=sleeps.append, rng=_random.Random(0))
+        assert calls["n"] == 1  # No retry.
+        assert sleeps == []
+
+    def test_budget_exhaustion_reraises_last_exception(self) -> None:
+        sleeps: list[float] = []
+        calls = {"n": 0}
+
+        def fn() -> str:
+            calls["n"] += 1
+            raise InternalServerError(
+                message=f"boom{calls['n']}",
+                response=_httpx_response(500),
+                body=None,
+            )
+
+        with pytest.raises(InternalServerError):
+            _call_with_retry(fn, sleeper=sleeps.append, rng=_random.Random(0))
+        # 3 attempts total, 2 sleeps between them, then raise on the third failure.
+        assert calls["n"] == 3
+        assert len(sleeps) == 2
+
+    def test_retry_after_header_honoured_on_429(self) -> None:
+        sleeps: list[float] = []
+        calls = {"n": 0}
+
+        def fn() -> str:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RateLimitError(
+                    message="slow",
+                    response=_httpx_response(429, headers={"retry-after": "7"}),
+                    body=None,
+                )
+            return "ok"
+
+        result, attempts = _call_with_retry(fn, sleeper=sleeps.append, rng=_random.Random(0))
+        assert result == "ok"
+        assert attempts == 2
+        # The Retry-After header value wins over the computed backoff.
+        assert sleeps == [pytest.approx(7.0)]
+
+    def test_max_attempts_one_disables_retry(self) -> None:
+        sleeps: list[float] = []
+        calls = {"n": 0}
+
+        def fn() -> str:
+            calls["n"] += 1
+            raise InternalServerError(message="boom", response=_httpx_response(500), body=None)
+
+        with pytest.raises(InternalServerError):
+            _call_with_retry(fn, sleeper=sleeps.append, rng=_random.Random(0), max_attempts=1)
+        assert calls["n"] == 1
+        assert sleeps == []
+
+
+class TestCompleteRetryIntegration:
+    """End-to-end retry behaviour through `complete()`. Sleeper patched out."""
+
+    def test_complete_retries_through_to_success(self, tmp_path: Path) -> None:
+        sleeps: list[float] = []
+        calls = {"n": 0}
+
+        def _create(**kw: Any) -> object:
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise InternalServerError(message="boom", response=_httpx_response(500), body=None)
+            return _fake_response(content=[], input_tokens=10, output_tokens=5)
+
+        client = SimpleNamespace(messages=SimpleNamespace(create=_create))
+        with (
+            patch.object(llm_mod, "_get_client", return_value=client),
+            patch.object(llm_mod, "TextBlock", new=SimpleNamespace),
+            patch.object(llm_mod, "_SLEEPER", sleeps.append),
+            patch.object(llm_mod, "_RNG", _random.Random(0)),
+        ):
+            result = complete(
+                model_tier=ModelTier.HAIKU,
+                messages=[{"role": "user", "content": "hi"}],
+                workflow_id="wf-retry-success",
+                agent_name="tester",
+                log_root=tmp_path,
+            )
+        # The successful third call's cost is the recorded one.
+        assert result.cost_usd > 0
+        assert calls["n"] == 3
+        # Telemetry record carries the `attempts` additive key.
+        path_str, _, line_str = result.jsonl_ref.rpartition(":")
+        record = json.loads(
+            Path(path_str).read_text(encoding="utf-8").splitlines()[int(line_str) - 1]
+        )
+        assert record["attempts"] == 3
+
+    def test_complete_non_retryable_400_raises_no_retry(self, tmp_path: Path) -> None:
+        sleeps: list[float] = []
+        calls = {"n": 0}
+
+        def _create(**kw: Any) -> object:
+            calls["n"] += 1
+            raise BadRequestError(message="bad", response=_httpx_response(400), body=None)
+
+        client = SimpleNamespace(messages=SimpleNamespace(create=_create))
+        with (
+            patch.object(llm_mod, "_get_client", return_value=client),
+            patch.object(llm_mod, "_SLEEPER", sleeps.append),
+        ):
+            with pytest.raises(BadRequestError):
+                complete(
+                    model_tier=ModelTier.HAIKU,
+                    messages=[{"role": "user", "content": "hi"}],
+                    workflow_id="wf-retry-400",
+                    agent_name="tester",
+                    log_root=tmp_path,
+                )
+        assert calls["n"] == 1
+        assert sleeps == []
+
+    def test_complete_attempts_key_absent_on_first_try(self, tmp_path: Path) -> None:
+        response = _fake_response(content=[], input_tokens=10, output_tokens=5)
+        client = SimpleNamespace(messages=SimpleNamespace(create=lambda **kw: response))
+        with (
+            patch.object(llm_mod, "_get_client", return_value=client),
+            patch.object(llm_mod, "TextBlock", new=SimpleNamespace),
+        ):
+            result = complete(
+                model_tier=ModelTier.HAIKU,
+                messages=[{"role": "user", "content": "hi"}],
+                workflow_id="wf-retry-clean",
+                agent_name="tester",
+                log_root=tmp_path,
+            )
+        path_str, _, line_str = result.jsonl_ref.rpartition(":")
+        record = json.loads(
+            Path(path_str).read_text(encoding="utf-8").splitlines()[int(line_str) - 1]
+        )
+        # The contract: `attempts` is absent on a single-try call (additive).
+        assert "attempts" not in record
 
 
 # ---------------------------------------------------------------------------

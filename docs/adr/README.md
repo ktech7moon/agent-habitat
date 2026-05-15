@@ -4,7 +4,7 @@
 
 | ADR | Title | Status |
 |-----|-------|--------|
-| ADR-001 | LangGraph over CrewAI — state-machine debuggability vs natural-language handoff opacity | Proposed |
+| ADR-001 | [LangGraph over CrewAI](ADR-001-langgraph-over-crewai.md) — state-machine debuggability vs natural-language handoff opacity | Accepted (2026-05-13) |
 | ADR-002 | Persistence schema — SQLite tables for workflows, workflow_steps, events; output_ref to JSONL | Proposed |
 | ADR-003 | Web search tool for Researcher agent — Anthropic web_search vs Tavily vs Brave vs custom | Proposed |
 | ADR-004 | ICP rubric format — TOML, operator-tunable scoring dimensions | Proposed |

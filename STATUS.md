@@ -4,11 +4,104 @@
 Phase 2 — 5-Agent Lead Enrichment Crew (full plan: docs/ROADMAP.md)
 
 ## Current Slice
-Phase 2 Slice 2 — Researcher agent + `llm.py` `tools=` passthrough + `RawSignals`
-**— COMPLETE 2026-05-14**. Live smoke passed against `Anthropic`; real
-readable cited spans landed in RawSignals; full habitat round-trip resolved.
-Phase 2 Slice 3 (Extractor agent) is next. ADR-004 (ICP rubric format) must
-land before Slice 4 (Scorer), not Slice 3. Phase 1 remains shippable.
+Phase 2 Slice 3 — Extractor agent + `CompanyProfile` + `ExtractionGap` +
+source-span refs **— COMPLETE 2026-05-14**. Live smoke passed against
+`Anthropic`; full Researcher→Extractor round-trip resolved; the substring
+grounding validator caught TWO real over-reaches in the wild (`industry`
+and `tech_stack` were proposed by the model with quotes that did not
+substring-match the cited signals — both downgraded to
+`span_not_grounded` gaps). Phase 2 Slice 4 (Scorer) is next; ADR-004
+(ICP rubric format) must land BEFORE Slice 4 starts. Phase 1 remains
+shippable.
+
+## Phase 2 Slice 3 Subtasks (Extractor + CompanyProfile + ExtractionGap)
+- [x] `agents/models.py` extension — `SourceSpan`, `ExtractionGap`, `ProfileField` (mutually-exclusive value-or-gap with model_validator), `CompanyProfile` (5 fields: size / industry / tech_stack / recent_news / decision_makers). Every model `ConfigDict(extra="forbid", frozen=True)`. `PROFILE_FIELD_NAMES` tuple is the canonical iteration order.
+- [x] `agents/extractor.py` — `run_extractor(conn, *, raw_signals, ...)`, Sonnet tier via `llm.complete()` (no `llm.py` change), `run_step()` per ADR-006 §2. Empty `RawSignals` short-circuits to all-gaps profile with NO LLM call (cost $0), step COMPLETED. Projection mirrored: `{has_size, has_industry, has_tech_stack, has_recent_news, has_decision_makers, gap_count}`.
+- [x] Substring-grounding validator (`_ground_field` / `_ground_profile`) — every `SourceSpan.quote` must appear (whitespace-collapse + lowercase normalised) in `raw_signals.signals[span.signal_index].text`. Over-reach is downgraded to `ExtractionGap(reason="span_not_grounded")`; the Extractor never lets a fabrication through. This is also how the short-cited-text-span forward dependency from the ADR-003 addendum is HANDLED in this slice (see Open Questions resolution below).
+- [x] `cli.py` — `agent-habitat run-extractor COMPANY_NAME [--db PATH] [--max-searches N] [--researcher-workflow-id ID] [--extractor-workflow-id ID]` sequences Researcher then Extractor as two separate workflows (Slice 6's orchestrator will unify them). Decision-support footer on the output; non-zero exit on FAILED.
+- [x] 52 deterministic tests in `tests/test_extractor.py` — models (16); parse + grounding helpers including the over-reach downgrade + out-of-range-signal-index downgrade (11); happy run + projection + audit chain (6); empty-outcome (3); sparse signals (1); short-span over-reach (2 — THE inherited forward-dependency); infrastructure failure including malformed-JSON and bad-schema responses (3); CLI happy + researcher-failure + extractor-failure (3). One live smoke (`@pytest.mark.live`).
+- [x] Full suite (278 deterministic + 1 extractor live smoke) passes; ruff check + ruff format --check + mypy strict all clean.
+
+## Phase 2 Slice 3 Structured-Output Method Choice
+**Choice: schema-in-system-prompt + Pydantic `model_validate_json` on `LLMResult.content`.** Documented in `extractor.py`'s module docstring.
+
+The Researcher does NOT parse a structured JSON object out of the LLM
+response — it reads typed `LLMResult.citations` produced by `llm.py`. So
+there is no pre-existing project pattern for "parse a Pydantic object out
+of `LLMResult.content`"; Slice 3 establishes one. The three API-level
+alternatives are:
+
+  1. `messages.parse(output_format=Model)` — different SDK entrypoint;
+     requires an `llm.py` change.
+  2. Strict tool use (`tools=[{strict: True, ...}]` + `tool_choice`) —
+     requires adding a `tool_choice` kwarg to `llm.complete()`.
+  3. Schema-in-system-prompt + parse-from-content (CHOSEN) — uses the
+     existing `llm.complete()` contract unchanged; the Extractor parses
+     `LLMResult.content` itself.
+
+Choice rationale: (1) and (2) both require `llm.py` changes, which
+ADR-006 makes their own decision and the Slice 3 kickoff explicitly says
+to STOP and flag for. (3) consumes only what `llm.complete()` already
+returns and keeps the Extractor's interface narrow.
+`ConfigDict(extra="forbid")` on every Slice 3 Pydantic model makes the
+schema strict on parse — unexpected fields the model invents are
+rejected, not silently accepted. The trade-off accepted: the model can
+emit malformed JSON; we treat that as an infrastructure failure (no
+retry), exactly the same way the Researcher treats an API exception.
+
+## Phase 2 Slice 3 Live Smoke Calibration
+
+One live Researcher+Extractor run against `Anthropic` on 2026-05-14
+(researcher: `claude-haiku-4-5-20251001` + web_search; extractor:
+`claude-sonnet-4-6`). Genuine observations a mocked test could not
+have surfaced — the first real audit-grade extraction round-trip:
+
+- **Extractor cost: $0.008772** for one Sonnet call on ~2K-3K input
+  tokens + ~300 output tokens (5 signals as input). Significantly cheaper
+  than the Researcher ($0.064634 same run): the Extractor neither
+  invokes web_search nor processes inline search results, just structured
+  output from short prose. **Researcher+Extractor combined: $0.073406**
+  for the two agents.
+- **Wall-time: 5.64s for the Extractor**, 8.16s for the Researcher.
+  Total ~14s for the two-agent slice on a real workload. Consistent with
+  Slice 2's "~15-25s end-to-end for 5 agents" projection — five agents
+  remain plausibly within that range if Scorer/Critic stay cheap.
+- **THE FABRICATION-RESISTANCE VALIDATOR CAUGHT TWO REAL OVER-REACHES.**
+  On the first live extraction the Sonnet model proposed extractions for
+  `industry` and `tech_stack` with `source_spans` whose `quote` text did
+  NOT substring-match (after normalisation) the cited
+  `raw_signals.signals[span.signal_index].text`. Both fields were
+  downgraded to `ExtractionGap(reason="span_not_grounded")` — exactly
+  the failure mode the design exists to catch. This validates the contract
+  in the wild, not just in a mocked unit test:
+    `recent_news: VALUE  — extracted, 3 grounded spans`
+    `size: GAP — field_not_in_signals (model honestly returned a gap)`
+    `industry: GAP — span_not_grounded (OVER-REACH CAUGHT)`
+    `tech_stack: GAP — span_not_grounded (OVER-REACH CAUGHT)`
+    `decision_makers: GAP — field_not_in_signals (model honestly returned a gap)`
+  Field extraction rate on a 5-signal news-heavy input: 1/5 (20%). Gap
+  rate: 4/5 (80%) — of which 2 are model-honest gaps and 2 are over-reach
+  catches.
+- **Short cited_text spans show up in practice as expected.** 3 of the
+  signals used by the extractor were <200 chars (short cited_text
+  fragments — the forward dependency from the ADR-003 addendum). The
+  substring validator handled them correctly: the one field where the
+  model honestly grounded against short spans (`recent_news`) survived;
+  the two fields where it over-reached against narrow spans
+  (`industry`, `tech_stack`) were caught and gapped.
+- **Cost calibration update for the full 5-agent pipeline.** Slice 2's
+  recalibrated projection of $0.10–$0.15 per full run still looks correct
+  on these numbers: Researcher ($0.065) + Extractor ($0.009) is $0.074;
+  add Haiku Critic (~$0.001), Sonnet Scorer (~$0.005), Opus Drafter
+  (~$0.04) and the projection lands at ~$0.12. ADR-003 addendum's queued
+  `budgets.toml` re-validation (Slice 8) gets more data here but
+  $10/day still affords ~80 full runs.
+- **JSONL telemetry round-trip resolves end-to-end on the Extractor.**
+  step.output_ref → JSONL line → `workflow_id`, `agent_name=extractor`,
+  `model=claude-sonnet-4-6`, both token counts, cost, full response text.
+  Same audit shape as the Researcher's path. The chain back from
+  `CompanyProfile.size.source_spans[0]` → `raw_signals.signals[idx].text`
+  → `Citation.cited_text` in the Researcher's JSONL is traceable end-to-end.
 
 ## Phase 2 Slice 2 Subtasks (Researcher + llm.py tools= + RawSignals)
 - [x] `llm.py` extended additively: optional `tools=` param on `complete()` forwarded to `messages.create`; `compute_cost_usd` extended with `web_search_requests=0` kw-only and adds `n * $0.01` server-tool fee onto `cost_usd`; new dated `_WEB_SEARCH_FEE_USD = 0.01` constant ("NEEDS VERIFICATION against current Anthropic pricing"); JSONL telemetry record gains additive `web_searches` / `web_search_fee_usd` keys (only when `tools` is provided — ordinary no-tools calls keep their record shape unchanged); `LLMResult` gains additive `web_searches: int = 0` and `citations: list[Citation] = []`; existing fields untouched, contract still additive
@@ -179,7 +272,7 @@ Slice 7 calibration story / README:
 ## Open Questions
 - **ADR-003 premise — RESOLVED 2026-05-14** by the ADR-003 Addendum (`docs/adr/ADR-003-web-search-tool.md`, "Addendum (2026-05-14): `cited_text` grounding + cost recalibration"). The core ADR-003 decision (Anthropic `web_search`, single SDK call, cost through `llm.py`, no second client) stands; the addendum corrects the mechanism — Signals are built from `citations[].cited_text` rather than the opaque `web_search_tool_result.encrypted_content` — and ratifies the consequence that uncited model narrative produces no Signal (right fabrication-resistance semantics). ADR-006 §3's substring-check mechanism works as written against `cited_text` spans; **no ADR-006 amendment required**. Forward dependencies the addendum surfaced are recorded as their own entries below.
 - **ADR-003 cost recalibration — RESOLVED 2026-05-14** in the addendum's §3. Documented per-run cost is now ~$0.067 (real breakdown: $0.034971 input + $0.0019 output + $0.030 fee). The two downstream re-checks the recalibration forces are recorded as separate forward-dependency entries below; no decision pending here.
-- **Forward dependency from ADR-003 Addendum (Slice 3, Extractor): short `cited_text` spans are legitimate-but-narrow grounding.** A `cited_text` span may be a short fragment (clause / phrase), not always a full sentence — that is the right semantics, but it tightens what a downstream agent can legitimately ground against. Slice 3 should treat short-span Signals as legitimate grounding, not as low-quality data to be filtered. The Extractor's source-span tracking (each `CompanyProfile` field carries a substring reference into `RawSignals`) must be robust to short upstream spans. Slice 7 (Critic) should include a red-team smoke that paraphrases beyond the boundaries of a short cited span to verify the pure-Python substring check rejects it.
+- **Forward dependency from ADR-003 Addendum (Slice 3, Extractor): short `cited_text` spans are legitimate-but-narrow grounding — RESOLVED 2026-05-14 (Slice 3).** The Extractor handles short upstream spans via the `_ground_field` substring validator in `agents/extractor.py`: every extracted `SourceSpan.quote` is verified (whitespace-collapse + lowercase normalised) as a substring of `raw_signals.signals[span.signal_index].text`. A short span is legitimate grounding for whatever the span text literally supports; a `quote` that over-reaches beyond the span text is downgraded to `ExtractionGap(reason="span_not_grounded")` rather than allowed through. Confirmed empirically on the Slice 3 live smoke: 3 of the cited spans used were <200 chars (short fragments), the honest-grounding case survived (`recent_news`), and TWO real over-reaches by the live Sonnet model were caught and gapped (`industry`, `tech_stack`). Forward dependency for Slice 7 (Critic) stands: the Critic's red-team smoke should still paraphrase beyond the boundaries of a short cited span to verify the equivalent substring check rejects it in the drafter→critic direction.
 - **Forward dependency from ADR-003 Addendum (Slice 8 / budgets.toml re-check).** `config/budgets.toml` `lead_enrichment` daily cap = $10.00 was set against the original $0.035–$0.045 per-Researcher-run estimate. At the recalibrated ~$0.07/Researcher-run and a projected ~$0.10–$0.15 per full 5-agent run, $10/day still affords ~66–100 full runs/day — likely still adequate but **explicitly unverified against the corrected numbers**. Re-validate the cap when Slice 8 produces real end-to-end cost numbers across all five agents. Not an emergency tightening; a calibration update.
 - **Forward dependency from ADR-003 Addendum (ADR-006 §1 checkpoint cost-rationale re-check).** ADR-006 §1's checkpoint placement rationale reads: "the rest of the upstream chain at Haiku+Sonnet costs roughly $0.01–$0.02 combined." With the corrected Researcher cost (~$0.07 alone), the upstream chain is more honestly ~$0.07–$0.10. The checkpoint break-even *logic* is unaffected (Opus draft cost $0.025–$0.060 dominates the savings calculus regardless), but §1's prose understates upstream cost by ~5×. When Slice 8 calibration data lands, either update §1's prose with the real number or attach a calibrated-figure pointer; do not silently leave the stale figure.
 - **Consolidate `llm.py`'s JSONL telemetry writer through the ObservabilityLayer.** Today `llm.py._append_telemetry` writes JSONL directly; Slice 4 added the conventioned READ side (`iter_telemetry`, `resolve_output_ref`) but did NOT touch the writer — `LLMResult` is a load-bearing contract and rule #14 forbids broad refactors without an ADR. Future work: either (a) route llm.py's writer through an ObservabilityLayer writer module so the path/line/format conventions live in one place, or (b) explicitly document the writer-stays-in-llm.py boundary as the chosen architecture. Trigger: any second writer of JSONL telemetry (Slice 5 checkpoint payloads? Phase 2 agent intermediate artefacts?) — that's the moment to centralise.
@@ -191,6 +284,52 @@ Slice 7 calibration story / README:
 - **`run_step()` utility — IMPLEMENTED 2026-05-14.** `src/agent_habitat/orchestration/run_step.py` ships the `StepRecorder` dataclass + `run_step()` context manager exactly per ADR-006 §2. Summarizer retrofitted onto it in the same commit; 20 deterministic tests in `tests/test_run_step.py`; all 196 deterministic tests pass; live smoke confirmed. Cosmetic trim (docstring, section dividers, WORKFLOW_TYPE/AGENT_NAME inlined) rode along. summarizer.py: 645 → 391 lines.
 
 ## Last Session
+Phase 2 Slice 3 — Extractor agent + `CompanyProfile` model + ExtractionGap
+pattern + source-span grounding. Built `agents/extractor.py` and extended
+`agents/models.py` with `SourceSpan` / `ExtractionGap` / `ProfileField` /
+`CompanyProfile`; wired through `run_step()` per ADR-006 §2; added
+`run-extractor` CLI; 52 deterministic tests + one live smoke that passed
+on the first run and caught two real over-reaches in the wild.
+
+**Structured-output method chosen: schema-in-system-prompt + Pydantic
+`model_validate_json(LLMResult.content)`.** No `llm.py` changes — the
+two API-level alternatives (`messages.parse()` and strict tool use with
+`tool_choice`) both would have required them. `ConfigDict(extra="forbid")`
+on every Slice 3 model makes the schema strict on parse; the Extractor
+treats malformed JSON / schema mismatch as infrastructure failure (no
+retry), same shape as the Researcher's API-exception path.
+
+**The substring grounding validator works.** The most important Slice 3
+finding came from the live smoke: the Sonnet model proposed extractions
+for `industry` and `tech_stack` with `source_spans` whose `quote` did
+not actually substring-match the cited `raw_signals.signals[idx].text`.
+The `_ground_field` validator caught both and downgraded them to
+`ExtractionGap(reason="span_not_grounded")`. This is the
+fabrication-resistance contract working on real data on the first call —
+the design instinct is validated in the wild, not just in a mocked unit
+test. ADR-003 addendum's short-span forward-dependency for Slice 3 is
+RESOLVED with this validator (still open for Slice 7's Critic, which
+runs the equivalent check in the drafter→critic direction).
+
+**Calibration: Extractor cost is $0.009/run on real Researcher output**,
+~14x cheaper than the Researcher's $0.065/run on the same input. Total
+Researcher+Extractor: $0.073. Wall-time: 5.64s for the Extractor, 14s
+combined. Field extraction rate on a 5-signal news-heavy input: 1/5
+(20%) extracted, 4/5 (80%) gaps — of which 2 are model-honest gaps and
+2 are over-reach catches. Full calibration table in the "Phase 2 Slice 3
+Live Smoke Calibration" section above.
+
+File outputs: `src/agent_habitat/agents/extractor.py` (new),
+`src/agent_habitat/agents/models.py` (extended with the 4 new Pydantic
+models + `PROFILE_FIELD_NAMES`), `src/agent_habitat/agents/__init__.py`
+(export surface), `src/agent_habitat/cli.py` (`run-extractor` command +
+`EXTRACTOR_DECISION_FOOTER` + formatter), `tests/test_extractor.py`
+(52 deterministic + 1 live smoke), `STATUS.md` updated. Full suite: 278
+deterministic + 1 extractor live smoke passes; ruff check + ruff
+format --check + mypy strict all clean. No `pip install`. No `llm.py` /
+`run_step.py` / ADR-002 / `RawSignals` changes.
+
+## Prior Session
 ADR-003 Addendum — `cited_text` grounding correction + per-Researcher-run cost
 recalibration. **Documentation/decision only — zero code changes.**
 
@@ -511,46 +650,40 @@ Slice 3's actual new work (per the kickoff prompt) was the budget-check + halt-s
 Tests: 40 deterministic tests in `tests/test_budget.py` — pure evaluator across boundary/edge cases (zero cap, threshold=0, threshold=1, at-cap, at-threshold); UTC window correctness including tz conversion and naive-datetime defensive path; `cost_within_window` inclusion/exclusion at boundaries and isolation across workflows; end-to-end check with override resolution; exceed-event row shape; halt-signal query including the "unrelated error event must not trip the halt" anti-confusion case; TOML config loading including missing file, malformed TOML, missing required key, missing [defaults] section, override without `daily_cap_usd`, threshold out of range, and a sanity-check that the bundled `config/budgets.toml` loads. Full suite (90 tests including llm.py and state) passes cleanly. ruff check + ruff format + mypy strict all clean.
 
 ## Next Session Entry Point
-**Phase 2 Slice 3 — Extractor agent + `CompanyProfile` model.** Fresh
-session, Opus high (slice implementation). ADR-006 §1 names the contract:
-the Extractor consumes `RawSignals`, produces `CompanyProfile` (with the
-ExtractionGap pattern per PATTERNS.md #2 — each structured field carries
-a source-span reference back into `RawSignals`), and mirrors
-`{has_size, has_tech_stack, has_decision_makers, gap_count}` onto
-`step.completed`. Tier: Sonnet (ADR routing table). Build:
+**ADR-004 — ICP rubric format. MUST land before Phase 2 Slice 4 (Scorer)
+starts.** Fresh session, Opus high (architecture decision). The Scorer
+consumes a `CompanyProfile` (Slice 3, DONE) and a TOML-defined ICP rubric
+and emits a `ScoredCompany` (score + threshold + passed_floor + reasoning).
+The rubric format is the operator-tunable knob (CLAUDE.md rule 7:
+"operator tunes outcomes; developers tune prompts"); the shape of the
+TOML is an ADR-grade decision because every Scorer implementation choice
+follows from it. Alternatives to weigh in the ADR:
 
-1. **`agents/models.py` extension** — add `CompanyProfile` and any
-   `ExtractionGap` / `ProfileField` shape. Each extracted field carries
-   the verbatim source span it was derived from (a substring of some
-   upstream `Signal.text`). The substring constraint is what makes the
-   Slice 7 critic's fabrication check tractable — same discipline as
-   the Researcher's `Signal.text` from `cited_text`.
-2. **`src/agent_habitat/agents/extractor.py`** — `run_extractor(conn,
-   *, raw_signals, ...)` via `run_step()`, one Sonnet call, structured
-   output with field-level source-span tracking. Mirror the projection
-   above onto `step.completed`.
-3. **CLI** — `agent-habitat run-extractor` that consumes a workflow id
-   whose RawSignals was already produced (or runs the Researcher
-   inline as a convenience). Decision-support footer on output.
-4. **Tests** — deterministic with mocked LLM (happy + each gap state)
-   plus one live smoke. Stress-test that extracted spans really
-   substring-match into `RawSignals.signals[].text`.
+- Weighted feature scoring (per-field weight + threshold) — simple, fully
+  TOML-defined, no LLM judgment beyond profile-to-feature mapping.
+- LLM-as-judge against a prose rubric — TOML carries instructions; the
+  LLM emits a numeric score with reasoning. Higher-fidelity, less
+  auditable.
+- Hybrid (deterministic feature score + LLM commentary) — most projects
+  end up here; ADR should weigh whether Phase 2's audit-grade posture
+  justifies the deterministic-first shape.
 
-ADR-003 Addendum (DONE 2026-05-14) ratified `citations[].cited_text` as
-the grounding corpus and recalibrated per-Researcher-run cost to ~$0.067;
-no ADR-006 amendment was required (§3's substring check works as written
-against `cited_text` spans). Two forward dependencies the addendum
-surfaced — `budgets.toml` re-validation and ADR-006 §1 prose re-check —
-are queued under Open Questions for Slice 8, not blocking Slice 3.
-ADR-004 (ICP rubric format) must land BEFORE Slice 4 (Scorer), NOT
-Slice 3.
+Once ADR-004 lands, Slice 4 (Scorer) can build against it: Sonnet tier
+per ADR-006; mirror `{score, threshold, passed_floor}` onto
+`step.completed`; below-floor result routes via conditional edge to
+`terminate_no_draft` (orchestrator's job in Slice 6 — Slice 4 just emits
+the signal).
 
-A Slice-3-relevant nuance from the addendum: `cited_text` spans may be
-short fragments (clause / phrase), not always full sentences. The
-Extractor's source-span tracking (each `CompanyProfile` field carrying a
-substring reference into `RawSignals`) must be robust to short upstream
-spans — short-span Signals are legitimate-but-narrow grounding, not
-low-quality data to filter out.
+The Slice 3 Extractor + CompanyProfile + ExtractionGap shape is DONE
+and live-validated; the substring-grounding validator caught real
+over-reaches in the wild and is the model for the Slice 7 Critic's
+equivalent check in the drafter→critic direction. ADR-006 §3's
+substring discipline now has both an upstream half (Signal.text from
+cited_text) and a midstream half (ProfileField source-spans grounded
+into Signal.text); the downstream half (Draft claims grounded into the
+union of upstream textual outputs) is Slice 7's contribution.
 
-`run_step()`, `llm.py` `tools=` passthrough, `RawSignals`, and the
-Researcher are DONE. No re-work needed there.
+Two forward dependencies remain queued for Slice 8 (Open Questions):
+`budgets.toml` re-validation against real end-to-end cost, and ADR-006
+§1's checkpoint-rationale prose re-check (upstream-chain cost figure is
+~5× understated). Neither blocks Slice 4.

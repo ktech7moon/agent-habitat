@@ -21,11 +21,14 @@ import click
 
 from agent_habitat import __version__
 from agent_habitat.agents import (
+    ExtractorResult,
     ResearcherResult,
     SummarizerResult,
+    run_extractor,
     run_researcher,
     run_summarizer,
 )
+from agent_habitat.agents.models import PROFILE_FIELD_NAMES
 from agent_habitat.checkpoint import (
     Checkpoint,
     CheckpointError,
@@ -59,6 +62,12 @@ RESEARCHER_DECISION_FOOTER = (
     "Automated research signals; the model can miss, mis-cite, or "
     "stale-cite content. Treat as decision support, not as a substitute "
     "for verifying each source before acting."
+)
+
+EXTRACTOR_DECISION_FOOTER = (
+    "Automated extraction; structured fields are grounded against the "
+    "cited source spans shown but the model can omit, mis-attribute, or "
+    "over-narrow. Treat as decision support, not as verified facts."
 )
 
 
@@ -291,6 +300,118 @@ def cmd_run_researcher(
     click.echo(_format_researcher_result(result))
     if result.status is WorkflowStatus.FAILED:
         raise click.exceptions.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
+# Slice 3 (Phase 2): Extractor agent
+# ---------------------------------------------------------------------------
+
+
+@main.command("run-extractor")
+@click.argument("company_name")
+@click.option(
+    "--db",
+    "db_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=DEFAULT_DB_PATH,
+    show_default=True,
+    help="Path to the agent-habitat SQLite file.",
+)
+@click.option(
+    "--max-searches",
+    default=3,
+    show_default=True,
+    type=int,
+    help="Researcher's web_search cap (forwarded to run-researcher).",
+)
+@click.option(
+    "--researcher-workflow-id",
+    default=None,
+    help="Override the Researcher workflow id (used for tests / reruns).",
+)
+@click.option(
+    "--extractor-workflow-id",
+    default=None,
+    help="Override the Extractor workflow id (used for tests / reruns).",
+)
+def cmd_run_extractor(
+    company_name: str,
+    db_path: Path,
+    max_searches: int,
+    researcher_workflow_id: str | None,
+    extractor_workflow_id: str | None,
+) -> None:
+    """Run the Extractor agent: produces a CompanyProfile from RawSignals.
+
+    Slice 3 has no orchestrator yet, and `RawSignals` only exists in memory
+    after a Researcher run, so this CLI sequences two separate workflows:
+    first the Researcher (one Haiku call with web_search → RawSignals),
+    then the Extractor (one Sonnet call → CompanyProfile). If the Researcher
+    fails, the Extractor is not invoked. If the Researcher returns an empty
+    RawSignals, the Extractor still runs and produces an all-gaps profile
+    (a valid empty-outcome result per ADR-006 §1).
+
+    Phase 2 Slice 6's LangGraph orchestrator will collapse these into one
+    workflow; for now keeping them separate keeps the audit story honest.
+    """
+    conn = init_db(db_path)
+    try:
+        researcher_result = run_researcher(
+            conn,
+            company_name=company_name,
+            workflow_id=researcher_workflow_id,
+            max_searches=max_searches,
+        )
+        if researcher_result.status is WorkflowStatus.FAILED:
+            click.echo(_format_researcher_result(researcher_result))
+            raise click.exceptions.Exit(code=1)
+
+        extractor_result = run_extractor(
+            conn,
+            raw_signals=researcher_result.raw_signals,
+            workflow_id=extractor_workflow_id,
+        )
+    finally:
+        conn.close()
+
+    click.echo(_format_researcher_result(researcher_result))
+    click.echo("")
+    click.echo("=" * 60)
+    click.echo("")
+    click.echo(_format_extractor_result(extractor_result))
+    if extractor_result.status is WorkflowStatus.FAILED:
+        raise click.exceptions.Exit(code=1)
+
+
+def _format_extractor_result(result: ExtractorResult) -> str:
+    lines: list[str] = [
+        f"Workflow {result.workflow_id} — status: {result.status.value.upper()}",
+        f"Company  : {result.company_name}",
+        f"Cost USD : {result.cost_usd:.6f}",
+        f"Gaps     : {result.profile.gap_count}/{len(PROFILE_FIELD_NAMES)} fields",
+        "",
+    ]
+    if result.status is WorkflowStatus.COMPLETED:
+        for name in PROFILE_FIELD_NAMES:
+            field = result.profile.field(name)
+            lines.append(f"  {name}:")
+            if field.is_gap:
+                assert field.gap is not None
+                lines.append(f"    GAP — {field.gap.reason}")
+            else:
+                for v in field.values:
+                    lines.append(f"    - {v}")
+                for span in field.source_spans:
+                    preview = span.quote.strip().replace("\n", " ")
+                    if len(preview) > 160:
+                        preview = preview[:160] + "…"
+                    lines.append(f'      [signal {span.signal_index}] "{preview}"')
+            lines.append("")
+        lines.append(EXTRACTOR_DECISION_FOOTER)
+    else:
+        lines.append(f"Failed at step: {result.error_step or '(unknown)'}")
+        lines.append(f"Error: {result.error_message or '(no message)'}")
+    return "\n".join(lines)
 
 
 def _format_researcher_result(result: ResearcherResult) -> str:

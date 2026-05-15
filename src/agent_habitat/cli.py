@@ -43,6 +43,7 @@ from agent_habitat.checkpoint import (
     list_pending_checkpoints,
     reject_checkpoint,
 )
+from agent_habitat.llm import _bootstrap as _llm_bootstrap
 from agent_habitat.orchestration.crew_graph import (
     CrewResult,
     resume_crew,
@@ -110,6 +111,10 @@ DRAFTER_DECISION_FOOTER = (
 @click.group()
 def main() -> None:
     """agent-habitat: production-grade multi-agent orchestration framework."""
+    # CLI entrypoints load .env so ANTHROPIC_API_KEY is available for the
+    # Anthropic client. Library-context imports of llm.py do NOT read .env
+    # (the helper is intentionally not called at module top-level).
+    _llm_bootstrap()
 
 
 @main.command()
@@ -869,15 +874,19 @@ def _format_critic_result(result: CriticResult) -> str:
 
 
 #: Decision-support footer printed below crew results that produced a Draft.
-#: Same posture as the standalone Drafter footer plus a one-line nod to the
-#: substring-grounding chain still being a Slice-7 (Critic) responsibility.
+#: Same posture as the standalone Drafter footer; the substring-grounding
+#: chain is enforced live by the Critic on every invocation, with one
+#: bounded retry on first fabrication and a halt (workflow FAILED) on
+#: persistent fabrication after retry (ADR-006 §1, §3).
 CREW_DECISION_FOOTER = (
-    "Automated four-agent crew (researcher → extractor → scorer → drafter). "
-    "The drafter is Opus 4.7; enumerated claims trace to the per-dimension "
-    "scoring chain, but the verbatim substring-grounding check is a Slice 7 "
-    "(critic) responsibility — not enforced in this run. Verify every "
-    "concrete claim against the cited dimension before sending. Treat as "
-    "decision support, not as a sendable artefact."
+    "Automated five-agent crew (researcher → extractor → scorer → drafter → "
+    "critic). The drafter is Opus 4.7; the critic enforces a verbatim "
+    "substring-grounding check on every concrete claim and routes a first "
+    "failure back to the drafter for one bounded retry. Persistent "
+    "fabrication after retry halts the workflow (FAILED) rather than "
+    "shipping dubious prose. Verify every concrete claim against the "
+    "cited dimension before sending. Treat as decision support, not as a "
+    "sendable artefact."
 )
 
 
@@ -932,8 +941,9 @@ def cmd_run_crew(
     Resume paused:  `agent-habitat run-crew --resume WORKFLOW_ID`
 
     The crew is researcher → extractor → scorer → [human checkpoint] →
-    drafter (no critic yet — Slice 7). On a passing ScoredCompany the
-    graph pauses at the human checkpoint; approve via
+    drafter → critic (with one bounded retry on fabrication, then halt).
+    On a passing ScoredCompany the graph pauses at the human checkpoint;
+    approve via
     `agent-habitat checkpoint approve <checkpoint_id>` and then resume
     with `agent-habitat run-crew --resume <workflow_id>`.
 

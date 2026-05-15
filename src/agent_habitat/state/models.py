@@ -70,6 +70,48 @@ def new_workflow_id() -> str:
     return uuid.uuid4().hex
 
 
+_FORBIDDEN_WORKFLOW_ID_SUBSTRINGS = ("/", "\\", "\x00")
+
+
+def validate_workflow_id_for_path(workflow_id: str) -> str:
+    """Defensive guard at any filesystem-path boundary that consumes a
+    workflow_id. Returns the input unchanged on success; raises
+    ``ValueError`` on anything that could escape the intended directory.
+
+    workflow_id flows into telemetry paths
+    (``data/logs/YYYY-MM-DD/<workflow_id>.jsonl``). In production every
+    workflow_id is generated via ``new_workflow_id`` (uuid4 hex) so a
+    malicious value is theoretical; the goal here is to turn "trust the
+    caller" into "verified at boundary."
+
+    Rule set (intentionally tighter than "trust the caller" but looser
+    than strict uuid4-hex so legacy test/debug ids like ``wf-test`` still
+    work — the property protected is path-traversal, not identifier
+    shape):
+
+      - must be a non-empty string
+      - must NOT contain ``/`` or ``\\`` (path separators)
+      - must NOT contain a null byte
+      - must NOT start with ``.`` (blocks ``..``, ``.hidden``, etc.)
+      - must NOT equal ``..`` or ``.``
+
+    A future tightening to uuid4-only is straightforward: replace the
+    rule set with ``uuid.UUID(hex=workflow_id).hex == workflow_id``.
+    """
+    if not isinstance(workflow_id, str):
+        raise ValueError(f"workflow_id must be str, got {type(workflow_id).__name__}")
+    if not workflow_id:
+        raise ValueError("workflow_id must be a non-empty string")
+    if workflow_id.startswith("."):
+        raise ValueError(f"workflow_id must not start with '.' (got {workflow_id!r})")
+    for forbidden in _FORBIDDEN_WORKFLOW_ID_SUBSTRINGS:
+        if forbidden in workflow_id:
+            raise ValueError(
+                f"workflow_id contains forbidden character {forbidden!r} (got {workflow_id!r})"
+            )
+    return workflow_id
+
+
 def _utcnow_iso() -> str:
     """ISO-8601 UTC timestamp, the wire format for every TEXT timestamp column."""
     return datetime.now(UTC).isoformat()

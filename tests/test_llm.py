@@ -47,8 +47,9 @@ class TestCostMath:
         assert compute_cost_usd(ModelTier.SONNET, 1_000_000, 1_000_000) == pytest.approx(18.00)
 
     def test_opus_cost(self) -> None:
-        # 1M input @ $15, 1M output @ $75 → $90.00
-        assert compute_cost_usd(ModelTier.OPUS, 1_000_000, 1_000_000) == pytest.approx(90.00)
+        # 1M input @ $5, 1M output @ $25 → $30.00 (Opus 4.7 rates verified
+        # 2026-05-15; prior table had $15/$75 — Anthropic repriced).
+        assert compute_cost_usd(ModelTier.OPUS, 1_000_000, 1_000_000) == pytest.approx(30.00)
 
     def test_small_call_haiku(self) -> None:
         # 1000 input + 500 output on Haiku → 1000*1 + 500*5 = 3500 / 1e6 = $0.0035

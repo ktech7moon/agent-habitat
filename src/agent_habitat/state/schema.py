@@ -68,6 +68,14 @@ def connect(db_path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
 
     - `foreign_keys=ON` is per-connection in SQLite and OFF by default; turn
       it on so the FK references in our DDL are actually enforced.
+    - `journal_mode=WAL` lets concurrent readers proceed alongside a single
+      writer and reduces "database is locked" errors. WAL is database-wide
+      (not per-connection) and persists across closes, so the pragma is a
+      no-op when the database is already in WAL mode. WAL adds two sidecar
+      files (``<db>.db-wal``, ``<db>.db-shm``); both are covered by the
+      ``data/state/*.db*`` glob in ``.gitignore``. For ``:memory:`` databases
+      the pragma is silently ignored — SQLite reports back "memory" rather
+      than "wal" and that's the expected outcome under tests.
     - `row_factory=sqlite3.Row` lets persistence.py read columns by name.
     """
     path = Path(db_path)
@@ -75,6 +83,7 @@ def connect(db_path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
     return conn
 
 

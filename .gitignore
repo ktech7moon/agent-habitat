@@ -7,6 +7,8 @@ __pycache__/
 .coverage
 htmlcov/
 data/state/*.db
+data/state/*.db-wal
+data/state/*.db-shm
 data/logs/*.jsonl
 .env
 *.egg-info/

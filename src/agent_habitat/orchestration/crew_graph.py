@@ -661,6 +661,13 @@ def run_crew(
         if saver_conn is None:
             db_path = _resolve_db_path(conn)
             saver_conn = sqlite3.connect(db_path, check_same_thread=False)
+            # WAL on the SqliteSaver connection too — same property as the
+            # audit-DB connection (see state/schema.py::connect): concurrent
+            # readers + one writer, no "database is locked" errors when the
+            # two writers (audit + checkpoint) hit the file in quick
+            # succession. WAL is database-wide so this is a no-op if the
+            # audit-DB connection already set it.
+            saver_conn.execute("PRAGMA journal_mode = WAL")
         saver = SqliteSaver(saver_conn)
         saver.setup()
         owns_saver = True
@@ -757,6 +764,8 @@ def resume_crew(
         if saver_conn is None:
             db_path = _resolve_db_path(conn)
             saver_conn = sqlite3.connect(db_path, check_same_thread=False)
+            # WAL on the SqliteSaver connection (see run_crew for rationale).
+            saver_conn.execute("PRAGMA journal_mode = WAL")
         saver = SqliteSaver(saver_conn)
         saver.setup()
         owns_saver = True

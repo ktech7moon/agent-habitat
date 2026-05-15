@@ -29,6 +29,8 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+from ..state.models import validate_workflow_id_for_path
+
 
 class TelemetryReadError(Exception):
     """Raised on malformed JSONL, missing files, or out-of-range refs."""
@@ -63,6 +65,10 @@ def iter_telemetry(
     given day). Empty lines are silently skipped (mid-write tolerance).
     Malformed JSON raises `TelemetryReadError` with file:line context.
     """
+    # Defensive path-traversal guard at the read boundary too — the writer
+    # only accepts uuid4-hex workflow_ids, but the reader is called with
+    # whatever the CLI / debug tooling passes in.
+    validate_workflow_id_for_path(workflow_id)
     root = Path(log_root)
     if day is not None:
         path = root / day.strftime("%Y-%m-%d") / f"{workflow_id}.jsonl"

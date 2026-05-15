@@ -34,9 +34,23 @@ from anthropic.types import (
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, computed_field
 
-load_dotenv()
+from .state.models import validate_workflow_id_for_path
 
 log = structlog.get_logger(__name__)
+
+
+def _bootstrap() -> None:
+    """Load environment variables from .env into ``os.environ``.
+
+    Importing ``llm.py`` from a library context (tests, downstream
+    framework integration) should NOT read .env from disk — library
+    side-effects on import are surprising and break reproducible tests.
+    Call this from CLI entrypoints (see ``cli.py::main``) so that
+    ``ANTHROPIC_API_KEY`` is available when ``_get_client()`` first
+    constructs the Anthropic client. Tests that exercise live calls set
+    the env var directly via pytest fixtures.
+    """
+    load_dotenv()
 
 
 class ModelTier(str, Enum):
@@ -48,27 +62,37 @@ class ModelTier(str, Enum):
 
 
 # ---------------------------------------------------------------------------
-# RATE TABLE — NEEDS VERIFICATION against current Anthropic pricing.
+# RATE TABLE — values are USD per 1,000,000 tokens (input, output).
 #
-# Last reviewed: 2026-05-13. Values are USD per 1,000,000 tokens (input, output).
-# These are best-known values at time of writing; confirm against the public
-# Anthropic pricing page before trusting cost figures for budget decisions.
-# When verified or updated, bump the date stamp above.
+# Verified: 2026-05-15 against
+# https://platform.claude.com/docs/en/about-claude/pricing
+#   - Claude Haiku 4.5  : $1 / $5  per MTok (unchanged from 2026-05-13)
+#   - Claude Sonnet 4.6 : $3 / $15 per MTok (unchanged from 2026-05-13)
+#   - Claude Opus 4.7   : $5 / $25 per MTok (CHANGED — was $15/$75 at
+#                         kickoff; Anthropic repriced Opus 4.7 to be 3×
+#                         cheaper than Opus 4.1, the older rate. Slice 8's
+#                         calibration cost numbers reflect the OLD rates as
+#                         recorded in the JSONL telemetry; ADR-006 §1's
+#                         calibration footnote names the rate change.
+#                         Cost figures emitted post-this-stamp will be
+#                         lower than the Slice 8 numbers for any
+#                         Opus-bearing run.)
+# When re-verifying, bump the date stamp above.
 # ---------------------------------------------------------------------------
 _RATES_USD_PER_MTOK: dict[ModelTier, tuple[float, float]] = {
     ModelTier.HAIKU: (1.00, 5.00),
     ModelTier.SONNET: (3.00, 15.00),
-    ModelTier.OPUS: (15.00, 75.00),
+    ModelTier.OPUS: (5.00, 25.00),
 }
 
 
 # ---------------------------------------------------------------------------
-# SERVER-TOOL FEE — NEEDS VERIFICATION against current Anthropic pricing.
+# SERVER-TOOL FEE — $10 per 1,000 web_search requests = $0.01 per search,
+# billed in addition to the token costs above (ADR-003).
 #
-# $10 per 1,000 web_search requests = $0.01 per search, billed in addition
-# to the token costs above. Stamped 2026-05-14 (ADR-003); same
-# "verify before trusting" discipline applies as the token rate table.
-# When verified or updated, bump the date stamp.
+# Verified: 2026-05-15 against
+# https://platform.claude.com/docs/en/about-claude/pricing#web-search-tool
+# (unchanged from the 2026-05-14 stamp). When re-verifying, bump the date.
 # ---------------------------------------------------------------------------
 _WEB_SEARCH_FEE_USD: float = 0.01
 
@@ -170,28 +194,53 @@ def compute_cost_usd(
 
 
 def _telemetry_path(log_root: Path, workflow_id: str, now: datetime) -> Path:
+    # Defensive path-traversal guard: workflow_id is always uuid4 hex today
+    # (see state.models.new_workflow_id), but validate at the boundary so
+    # any future caller passing arbitrary text can't escape the log root.
+    validate_workflow_id_for_path(workflow_id)
     return log_root / now.strftime("%Y-%m-%d") / f"{workflow_id}.jsonl"
+
+
+#: In-memory cache of the current 1-indexed line count for every JSONL
+#: file written through ``_append_telemetry`` in this process. Keyed by
+#: the file's POSIX path so the cache is unique per
+#: (log_root, date, workflow_id) — tests that swap ``log_root`` get a
+#: distinct key automatically. Bounded by the number of distinct telemetry
+#: files a single process writes, which is the number of (date,
+#: workflow_id) pairs it serves.
+_LINE_COUNT_CACHE: dict[str, int] = {}
 
 
 def _append_telemetry(path: Path, record: dict[str, Any]) -> int:
     """Append one JSONL line; return its 1-indexed line number.
 
-    SINGLE-WRITER ASSUMPTION (Phase 1-2): workflows run synchronously per the
-    roadmap. No file lock, no async coordination. Re-evaluate when multi-process
-    orchestration triggers the Postgres migration (CLAUDE.md deferred list).
+    SINGLE-WRITER ASSUMPTION (Phase 1-2): workflows run synchronously per
+    the roadmap. The in-memory line-count cache (``_LINE_COUNT_CACHE``)
+    is correct under that assumption — every append goes through this
+    function, so the cached count is the authoritative current count. If
+    a second process appends to the same file concurrently the cache would
+    drift; this is documented as out-of-scope until cross-process
+    coordination is wired (CLAUDE.md deferred list).
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    existing = 0
-    if path.exists():
-        with path.open("rb") as f:
-            for _ in f:
-                existing += 1
+    key = path.as_posix()
+    cached = _LINE_COUNT_CACHE.get(key)
+    if cached is not None:
+        existing = cached
+    else:
+        existing = 0
+        if path.exists():
+            with path.open("rb") as f:
+                for _ in f:
+                    existing += 1
     line = json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n"
     with path.open("a", encoding="utf-8") as f:
         f.write(line)
         f.flush()
         os.fsync(f.fileno())
-    return existing + 1
+    new_line_no = existing + 1
+    _LINE_COUNT_CACHE[key] = new_line_no
+    return new_line_no
 
 
 _client: Anthropic | None = None

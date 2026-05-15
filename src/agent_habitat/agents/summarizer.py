@@ -41,7 +41,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import httpx
 import structlog
@@ -118,7 +118,14 @@ SYSTEM_PROMPT = (
 
 @dataclass(frozen=True)
 class SummarizerResult:
-    """What `run_summarizer` returns. Mirrors the workflow it just wrote."""
+    """What `run_summarizer` returns. Mirrors the workflow it just wrote.
+
+    `input_truncated` plus the three char counts surface the MAX_PROMPT_CHARS
+    truncation so a caller can see "this summary was of truncated input"
+    without digging through the event log — the input-side analogue of
+    `LLMResult.truncated` for output-side max_tokens cutoff. The counts are
+    char counts of the extracted readable text, not byte counts.
+    """
 
     workflow_id: str
     status: WorkflowStatus
@@ -127,6 +134,20 @@ class SummarizerResult:
     cost_usd: float
     error_step: str | None = None
     error_message: str | None = None
+    input_truncated: bool = False
+    original_chars: int = 0
+    used_chars: int = 0
+    dropped_chars: int = 0
+
+
+@dataclass(frozen=True)
+class _TruncationInfo:
+    """Internal: what the summarize step did to its input before the LLM call."""
+
+    truncated: bool
+    original_chars: int
+    used_chars: int
+    dropped_chars: int
 
 
 class SummarizerError(Exception):
@@ -315,7 +336,7 @@ def run_summarizer(
             work=lambda: extract_readable_text(html),
         )
 
-        summary, llm_cost, llm_ref = _run_summarize_step(
+        summary, llm_cost, llm_ref, truncation = _run_summarize_step(
             conn,
             workflow_id=wf_id,
             step_index=3,
@@ -396,6 +417,10 @@ def run_summarizer(
         url=url,
         summary=summary,
         cost_usd=cost_total,
+        input_truncated=truncation.truncated,
+        original_chars=truncation.original_chars,
+        used_chars=truncation.used_chars,
+        dropped_chars=truncation.dropped_chars,
     )
 
 
@@ -495,11 +520,17 @@ def _run_summarize_step(
     readable_text: str,
     log_root: Path | None,
     now: Callable[[], datetime],
-) -> tuple[str, float, str]:
+) -> tuple[str, float, str, _TruncationInfo]:
     """The LLM-bearing step. Records `cost_usd` + `output_ref` onto the row.
 
-    Returns `(summary, cost_usd, jsonl_ref)`. Raises `SummarizerError("summarize",
-    ...)` on any LLM/API exception, after persisting the FAILED step + event.
+    Returns `(summary, cost_usd, jsonl_ref, truncation)`. Raises
+    `SummarizerError("summarize", ...)` on any LLM/API exception, after
+    persisting the FAILED step + event. When the readable text exceeds
+    `MAX_PROMPT_CHARS` the truncation is detected, surfaced on the returned
+    `_TruncationInfo`, and recorded additively on the step.completed event's
+    `structured_data` (input_truncated / original_chars / used_chars /
+    dropped_chars) so the audit trail no longer hides the fact that the LLM
+    saw only a prefix of the page.
     """
     started = now().isoformat()
     step = WorkflowStep(
@@ -521,6 +552,15 @@ def _run_summarize_step(
         timestamp=now(),
     )
 
+    original_chars = len(readable_text)
+    used_chars = min(original_chars, MAX_PROMPT_CHARS)
+    dropped_chars = original_chars - used_chars
+    truncation = _TruncationInfo(
+        truncated=dropped_chars > 0,
+        original_chars=original_chars,
+        used_chars=used_chars,
+        dropped_chars=dropped_chars,
+    )
     prompt_text = readable_text[:MAX_PROMPT_CHARS]
 
     try:
@@ -574,23 +614,31 @@ def _run_summarize_step(
             }
         ),
     )
+    structured_data: dict[str, Any] = {
+        "step_name": "summarize",
+        "step_index": step_index,
+        "cost_usd": result.cost_usd,
+        "output_ref": result.jsonl_ref,
+        "input_tokens": result.input_tokens,
+        "output_tokens": result.output_tokens,
+        "truncated": result.truncated,
+    }
+    if truncation.truncated:
+        # Additive: only stamped when truncation actually happened, so an
+        # under-limit run records no false-positive truncation keys.
+        structured_data["input_truncated"] = True
+        structured_data["original_chars"] = truncation.original_chars
+        structured_data["used_chars"] = truncation.used_chars
+        structured_data["dropped_chars"] = truncation.dropped_chars
     emit_event(
         conn,
         workflow_id=workflow_id,
         event_type=EventType.STEP_COMPLETED,
         level=EventLevel.INFO,
         message="step completed: summarize",
-        structured_data={
-            "step_name": "summarize",
-            "step_index": step_index,
-            "cost_usd": result.cost_usd,
-            "output_ref": result.jsonl_ref,
-            "input_tokens": result.input_tokens,
-            "output_tokens": result.output_tokens,
-            "truncated": result.truncated,
-        },
+        structured_data=structured_data,
         step_id=step.id,
         timestamp=now(),
     )
 
-    return result.content.strip(), result.cost_usd, result.jsonl_ref
+    return result.content.strip(), result.cost_usd, result.jsonl_ref, truncation

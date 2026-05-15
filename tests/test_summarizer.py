@@ -40,6 +40,7 @@ from click.testing import CliRunner
 from agent_habitat.agents import summarizer as summarizer_mod
 from agent_habitat.agents.summarizer import (
     MAX_HTML_BYTES,
+    MAX_PROMPT_CHARS,
     MIN_READABLE_CHARS,
     SummarizerError,
     extract_readable_text,
@@ -471,6 +472,93 @@ class TestRunFailurePaths:
 
 
 # ---------------------------------------------------------------------------
+# Input truncation — MAX_PROMPT_CHARS visibility
+# ---------------------------------------------------------------------------
+
+
+def _summarize_completed_event(events: list[object]) -> object:
+    return next(
+        e
+        for e in events
+        if (getattr(e, "structured_data", None) or {}).get("event_type") == "step.completed"
+        and (getattr(e, "structured_data", None) or {}).get("step_name") == "summarize"
+    )
+
+
+class TestInputTruncation:
+    """Slice 7 follow-up: MAX_PROMPT_CHARS truncation must not be silent.
+
+    The summarize step caps prompt input at MAX_PROMPT_CHARS. Before this
+    fix, the LLM saw only a prefix and the workflow recorded COMPLETED with
+    no signal. These tests pin the visibility contract: the result carries
+    `input_truncated` + the three char counts, and the step.completed event
+    additively records the same data (only when truncation actually
+    happened).
+    """
+
+    def test_over_limit_sets_truncated_and_records_event(
+        self, conn: sqlite3.Connection, log_root: Path
+    ) -> None:
+        # Build a body whose readable extraction blows past MAX_PROMPT_CHARS.
+        sentence = "This is a sentence about programming languages and runtimes. "
+        long_body = sentence * 500  # ~31,000 chars — well over 12,000.
+        long_html = f"<html><body><main><p>{long_body}</p></main></body></html>"
+        http = _mock_client(_ok_handler(body=long_html))
+
+        with patch.object(summarizer_mod, "complete", return_value=_fake_llm_result()):
+            result = run_summarizer(
+                conn,
+                url="https://example.com/long",
+                http_client=http,
+                log_root=log_root,
+            )
+
+        assert result.status is WorkflowStatus.COMPLETED
+        assert result.input_truncated is True
+        assert result.original_chars > MAX_PROMPT_CHARS
+        assert result.used_chars == MAX_PROMPT_CHARS
+        assert result.dropped_chars == result.original_chars - result.used_chars
+        assert result.dropped_chars > 0
+
+        events = load_events(conn, result.workflow_id)
+        evt = _summarize_completed_event(events)  # type: ignore[arg-type]
+        sd = (getattr(evt, "structured_data", None) or {}).copy()
+        assert sd.get("input_truncated") is True
+        assert sd.get("original_chars") == result.original_chars
+        assert sd.get("used_chars") == result.used_chars
+        assert sd.get("dropped_chars") == result.dropped_chars
+
+    def test_under_limit_no_truncation_recorded(
+        self, conn: sqlite3.Connection, log_root: Path
+    ) -> None:
+        # SAMPLE_HTML extracts well under MAX_PROMPT_CHARS.
+        http = _mock_client(_ok_handler())
+
+        with patch.object(summarizer_mod, "complete", return_value=_fake_llm_result()):
+            result = run_summarizer(
+                conn,
+                url="https://example.com/",
+                http_client=http,
+                log_root=log_root,
+            )
+
+        assert result.status is WorkflowStatus.COMPLETED
+        assert result.input_truncated is False
+        assert result.original_chars > 0
+        assert result.used_chars == result.original_chars
+        assert result.dropped_chars == 0
+
+        events = load_events(conn, result.workflow_id)
+        evt = _summarize_completed_event(events)  # type: ignore[arg-type]
+        sd = getattr(evt, "structured_data", None) or {}
+        # Additive contract: no false-positive truncation keys on under-limit input.
+        assert "input_truncated" not in sd
+        assert "original_chars" not in sd
+        assert "used_chars" not in sd
+        assert "dropped_chars" not in sd
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -581,3 +669,45 @@ def test_live_summarizer_round_trip(conn: sqlite3.Connection, log_root: Path) ->
     assert "workflow.started" in types
     assert "workflow.completed" in types
     assert types.count("step.completed") == 3
+
+
+@pytest.mark.live
+@pytest.mark.skipif(
+    not os.environ.get("ANTHROPIC_API_KEY")
+    or os.environ["ANTHROPIC_API_KEY"].startswith("sk-ant-REPLACE"),
+    reason="ANTHROPIC_API_KEY not set; live smoke skipped.",
+)
+def test_live_wikipedia_truncation_visible(conn: sqlite3.Connection, log_root: Path) -> None:
+    """Closes the loop on the Slice 7 finding: the Wikipedia/Anthropic page
+    extracts to ~45K readable chars, well past MAX_PROMPT_CHARS=12,000. The
+    run must still COMPLETE, AND now must report input_truncated=True with
+    real char counts on both the result and the step.completed event.
+    """
+    result = run_summarizer(
+        conn,
+        url="https://en.wikipedia.org/wiki/Anthropic",
+        log_root=log_root,
+    )
+
+    print(f"\n[live-truncation] status={result.status.value}")
+    print(f"[live-truncation] input_truncated={result.input_truncated}")
+    print(
+        f"[live-truncation] original_chars={result.original_chars} "
+        f"used_chars={result.used_chars} dropped_chars={result.dropped_chars}"
+    )
+    print(f"[live-truncation] cost_usd={result.cost_usd:.6f}")
+
+    assert result.status is WorkflowStatus.COMPLETED
+    assert result.input_truncated is True
+    assert result.original_chars > MAX_PROMPT_CHARS
+    assert result.used_chars == MAX_PROMPT_CHARS
+    assert result.dropped_chars == result.original_chars - result.used_chars
+    assert result.summary is not None and result.summary.strip()
+
+    events = load_events(conn, result.workflow_id)
+    evt = _summarize_completed_event(events)  # type: ignore[arg-type]
+    sd = getattr(evt, "structured_data", None) or {}
+    assert sd.get("input_truncated") is True
+    assert sd.get("original_chars") == result.original_chars
+    assert sd.get("used_chars") == result.used_chars
+    assert sd.get("dropped_chars") == result.dropped_chars

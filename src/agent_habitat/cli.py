@@ -41,6 +41,11 @@ from agent_habitat.checkpoint import (
     list_pending_checkpoints,
     reject_checkpoint,
 )
+from agent_habitat.orchestration.crew_graph import (
+    CrewResult,
+    resume_crew,
+    run_crew,
+)
 from agent_habitat.scoring import DEFAULT_RUBRIC_PATH, RubricConfigError, load_rubric
 from agent_habitat.state import DEFAULT_DB_PATH, WorkflowStatus, init_db
 
@@ -681,6 +686,232 @@ def cmd_run_drafter(
         click.echo(_format_drafter_result(drafter_result, scorer_result))
         if drafter_result.status is WorkflowStatus.FAILED:
             raise click.exceptions.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 Slice 6: the LangGraph crew orchestrator.
+# ---------------------------------------------------------------------------
+
+
+#: Decision-support footer printed below crew results that produced a Draft.
+#: Same posture as the standalone Drafter footer plus a one-line nod to the
+#: substring-grounding chain still being a Slice-7 (Critic) responsibility.
+CREW_DECISION_FOOTER = (
+    "Automated four-agent crew (researcher → extractor → scorer → drafter). "
+    "The drafter is Opus 4.7; enumerated claims trace to the per-dimension "
+    "scoring chain, but the verbatim substring-grounding check is a Slice 7 "
+    "(critic) responsibility — not enforced in this run. Verify every "
+    "concrete claim against the cited dimension before sending. Treat as "
+    "decision support, not as a sendable artefact."
+)
+
+
+@main.command("run-crew")
+@click.argument("company_name", required=False)
+@click.option(
+    "--resume",
+    "resume_workflow_id",
+    default=None,
+    help="Resume a paused crew workflow by id (its approve_drafter checkpoint "
+    "must already be approved or rejected via the `checkpoint` CLI).",
+)
+@click.option(
+    "--db",
+    "db_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=DEFAULT_DB_PATH,
+    show_default=True,
+    help="Path to the agent-habitat SQLite file.",
+)
+@click.option(
+    "--rubric",
+    "rubric_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=DEFAULT_RUBRIC_PATH,
+    show_default=True,
+    help="Path to the ICP rubric TOML file (operator-tunable).",
+)
+@click.option(
+    "--max-searches",
+    default=3,
+    show_default=True,
+    type=int,
+    help="Researcher's web_search cap.",
+)
+@click.option(
+    "--workflow-id",
+    default=None,
+    help="Override the generated workflow id (used for tests / reruns).",
+)
+def cmd_run_crew(
+    company_name: str | None,
+    resume_workflow_id: str | None,
+    db_path: Path,
+    rubric_path: Path,
+    max_searches: int,
+    workflow_id: str | None,
+) -> None:
+    """Run the full lead-enrichment crew through the LangGraph orchestrator.
+
+    Initial run:    `agent-habitat run-crew COMPANY_NAME`
+    Resume paused:  `agent-habitat run-crew --resume WORKFLOW_ID`
+
+    The crew is researcher → extractor → scorer → [human checkpoint] →
+    drafter (no critic yet — Slice 7). On a passing ScoredCompany the
+    graph pauses at the human checkpoint; approve via
+    `agent-habitat checkpoint approve <checkpoint_id>` and then resume
+    with `agent-habitat run-crew --resume <workflow_id>`.
+
+    A gated ScoredCompany (`gated_by` set) routes to `terminate_no_draft`
+    — workflow COMPLETED, no Drafter cost paid. An operator rejection at
+    the checkpoint is also a valid empty-outcome (workflow CANCELLED, no
+    Drafter cost paid).
+    """
+    if resume_workflow_id is not None and company_name is not None:
+        raise click.UsageError("--resume and COMPANY_NAME are mutually exclusive — supply one.")
+    if resume_workflow_id is None and company_name is None:
+        raise click.UsageError(
+            "supply COMPANY_NAME (initial run) or --resume WORKFLOW_ID (resume paused)."
+        )
+
+    try:
+        rubric = load_rubric(rubric_path)
+    except RubricConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    conn = init_db(db_path)
+    try:
+        if resume_workflow_id is not None:
+            try:
+                result = resume_crew(
+                    conn,
+                    workflow_id=resume_workflow_id,
+                    rubric=rubric,
+                    max_searches=max_searches,
+                )
+            except ValueError as exc:
+                raise click.ClickException(str(exc)) from exc
+        else:
+            assert company_name is not None
+            result = run_crew(
+                conn,
+                company_name=company_name,
+                rubric=rubric,
+                workflow_id=workflow_id,
+                max_searches=max_searches,
+            )
+    finally:
+        conn.close()
+
+    click.echo(_format_crew_result(result))
+    if result.status is WorkflowStatus.FAILED:
+        raise click.exceptions.Exit(code=1)
+
+
+def _format_crew_result(result: CrewResult) -> str:
+    """Render the orchestrator's outcome. One of four shapes.
+
+    PAUSED   → instructions for the operator to approve/reject + resume.
+    COMPLETED with draft     → the drafter's prose + enumerated claims +
+                               coverage-aware footer.
+    COMPLETED with terminate → which gate fired + the audit framing.
+    CANCELLED                → rejection notice.
+    FAILED                   → offending step + error message.
+    """
+    lines: list[str] = [
+        f"Workflow {result.workflow_id} — status: {result.status.value.upper()}",
+        f"Company  : {result.company_name}",
+        f"Cost USD : {result.cost_usd:.6f}",
+        "",
+    ]
+    if result.status is WorkflowStatus.PAUSED:
+        cp_id_str = (
+            str(result.pending_checkpoint_id)
+            if result.pending_checkpoint_id is not None
+            else "(unknown)"
+        )
+        lines.extend(
+            [
+                "PAUSED — drafter approval required before producing prose.",
+                "",
+                f"  Pending checkpoint id: {cp_id_str}",
+                "",
+                "Next steps:",
+                f"  1. Inspect:  agent-habitat checkpoint show {cp_id_str}",
+                f"  2. Approve:  agent-habitat checkpoint approve {cp_id_str} --reviewer YOUR_NAME",
+                "     (or:      agent-habitat checkpoint reject  "
+                f"{cp_id_str} --reviewer YOUR_NAME --reason '…')",
+                f"  3. Resume:   agent-habitat run-crew --resume {result.workflow_id}",
+                "",
+                DECISION_SUPPORT_FOOTER,
+            ]
+        )
+        return "\n".join(lines)
+
+    if result.status is WorkflowStatus.CANCELLED:
+        lines.extend(
+            [
+                f"CANCELLED — operator rejected the drafter checkpoint "
+                f"(terminate_reason={result.terminate_reason!r}).",
+                "No drafter cost was paid; the audit row reflects the rejection.",
+            ]
+        )
+        return "\n".join(lines)
+
+    if result.status is WorkflowStatus.FAILED:
+        lines.extend(
+            [
+                f"Failed at step: {result.error_step or '(unknown)'}",
+                f"Error: {result.error_message or '(no message)'}",
+            ]
+        )
+        return "\n".join(lines)
+
+    # COMPLETED. Either we produced a draft, or terminate_no_draft routed.
+    if result.draft is not None and result.scored_company is not None:
+        sc = result.scored_company
+        score_str = f"{sc.score:.2f}" if sc.score is not None else "None"
+        coverage_pct = sc.coverage * 100.0
+        lines.append("Draft prose:")
+        lines.append(result.draft.prose)
+        lines.append("")
+        lines.append(
+            f"Enumerated claims ({result.draft.claim_count}, anchored to ScoredCompany dimensions):"
+        )
+        for i, claim in enumerate(result.draft.claims, start=1):
+            preview = claim.text.strip().replace("\n", " ")
+            if len(preview) > 160:
+                preview = preview[:160] + "…"
+            lines.append(f'  [{i}] dim={claim.supporting_dimension}: "{preview}"')
+        lines.append("")
+        lines.append(
+            f"Scored {score_str}/100 against the rubric, but the rubric covered "
+            f"{coverage_pct:.0f}% of the operator's stated ICP dimensions on this run."
+        )
+        lines.append("")
+        lines.append(CREW_DECISION_FOOTER)
+        return "\n".join(lines)
+
+    # COMPLETED with terminate_reason — gated, not a failure.
+    if result.scored_company is not None:
+        sc = result.scored_company
+        score_str = f"{sc.score:.2f}" if sc.score is not None else "None"
+        coverage_pct = sc.coverage * 100.0
+        lines.extend(
+            [
+                f"NO DRAFT — ScoredCompany was gated (terminate_reason="
+                f"{result.terminate_reason!r}).",
+                f"  score    : {score_str}   (floor {sc.floor:.1f})",
+                f"  coverage : {coverage_pct:.1f}%   (min_coverage {sc.min_coverage:.1%})",
+                "",
+                "The orchestrator routed to `terminate_no_draft`; no Drafter cost was paid.",
+            ]
+        )
+    else:
+        lines.append(
+            f"NO DRAFT — terminate_reason={result.terminate_reason!r} (no ScoredCompany available)."
+        )
+    return "\n".join(lines)
 
 
 def _format_no_draft(scorer_result: ScorerResult) -> str:

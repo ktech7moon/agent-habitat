@@ -16,6 +16,7 @@ from .models import (
     new_workflow_id,
 )
 from .persistence import (
+    has_langgraph_checkpoint,
     init_db,
     insert_event,
     insert_step,
@@ -41,6 +42,7 @@ __all__ = [
     "WorkflowStatus",
     "WorkflowStep",
     "connect",
+    "has_langgraph_checkpoint",
     "init_db",
     "init_schema",
     "insert_event",

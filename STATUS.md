@@ -4,21 +4,62 @@
 Phase 2 — 5-Agent Lead Enrichment Crew (full plan: docs/ROADMAP.md)
 
 ## Current Slice
-**Phase 2 Slice 5 (Drafter agent) — DONE 2026-05-14.** New
-`src/agent_habitat/agents/drafter.py` (Layer A `drafter_node` + Layer B
-`run_drafter`, sibling functions in one file matching the post-refactor
-pattern); `Draft` + `DraftClaim` Pydantic models added to
-`agents/models.py`; `run-drafter` CLI command added to `cli.py` (sequences
-Researcher → Extractor → Scorer → Drafter as four separate workflows,
-previewing the Slice 6 orchestrator's `terminate_no_draft` routing by
-skipping the Drafter call when the ScoredCompany is gated). 56
-deterministic tests + 1 live smoke. Full suite (426 deterministic, +1
-Drafter live smoke) clean; ruff check + ruff format + mypy strict all
-clean. **Slice 6 (orchestrator) and Slice 7 (critic) are now BOTH
-unblocked** — Slice 6 has all 5 Phase 2 agents available as Layer A pure
-nodes; Slice 7 has the load-bearing Slice 5 calibration finding to build
-its substring check against (see "Phase 2 Slice 5 Live Smoke Calibration"
-below).
+**Phase 2 Slice 6 (LangGraph orchestrator) — DONE 2026-05-14.** New
+`src/agent_habitat/orchestration/crew_state.py` (CrewState TypedDict)
+and `crew_graph.py` (StateGraph + four agent adapters + checkpoint
+node + terminate_no_draft node + two routing conditional edges +
+SqliteSaver wiring + `run_crew` / `resume_crew` entry points);
+reconciliation-vs-resume guard added to `state/persistence.py`
+(`has_langgraph_checkpoint` + skip-orphans-with-live-checkpoint
+behaviour in `reconcile_orphan_steps`); `run-crew` CLI command added to
+`cli.py` with `--resume WF_ID` mode. 21 new deterministic tests + 2
+new live smokes (full chain end-to-end + cross-session resume with
+real Opus). Full suite (447 deterministic) clean; ruff check + ruff
+format + mypy strict all clean. **Phase 2 Slice 7 (Critic) is the
+remaining piece** to complete the crew + close the load-bearing
+fabrication-resistance contract; the Slice 5 substring-failure
+findings ("Anthropic PBC" / "teamed with") survive in this STATUS.md
+as the calibration input for Slice 7's red-team smoke.
+
+**Phase 2 Slice 5 (Drafter agent) — DONE 2026-05-14.** Carried into
+Slice 6 unchanged: `agents/drafter.py` + `agents/models.py` (`Draft`
++ `DraftClaim`) + `run-drafter` CLI all preserved. Slice 6 wires the
+Drafter's Layer A `drafter_node` into LangGraph as the fourth node;
+the standalone `run-drafter` CLI command stays as a parallel
+entrypoint.
+
+## Phase 2 Slice 6 Subtasks (LangGraph orchestrator + crew state machine + SqliteSaver)
+
+- [x] **STOP #1 — scope confirmation.** Slice 6 wires FOUR Phase 2 agents into a LangGraph `StateGraph(CrewState)` with `SqliteSaver` checkpointing: researcher → extractor → scorer → [human checkpoint] → drafter. The Slice 7 critic, the bounded fabrication-retry edge, the 3-5 company calibration (Slice 8), CLI splitting, and the summarizer (not a crew node per ADR-006 §1) are all OUT of scope. Confirmed against ADR-006 §1's topology before any code.
+- [x] **STOP #2 — persistence ownership (chose Option A).** The orchestrator owns the workflow row; each agent-bearing node adapter wraps its Layer A call in `run_step(...)` (which is already step-only by ADR-006 §2's contract). The existing Layer B wrappers (`run_researcher` &c.) stay UNCHANGED for standalone CLI use. The audit shape ADR-002 specifies — one `workflows` row + N `workflow_steps` rows + an `events` narrative — is preserved. Option B (drop ADR-002 tables for crew runs) was rejected: it splits the audit story across two unrelated formats, contradicting ADR-002's "audit log wants to know about steps that *didn't* complete." Option C (hybrid) yielded no compelling intermediate. No ADR-002 addendum required.
+- [x] **STOP #3 — SqliteSaver coexistence + thread_id + resume guard.** Verified live: SqliteSaver(conn) over the existing `data/state/agent_habitat.db` creates `checkpoints` + `writes` tables; neither name collides with ADR-002's `workflows` / `workflow_steps` / `events`. `thread_id = workflow_id` (uuid4 hex 32 chars) works as opaque text — no format constraints. Two `sqlite3.Connection` instances open the same .db file (one for audit tables with `check_same_thread=True`, one for SqliteSaver with `check_same_thread=False`); independent transactions, ADR-002's two-writers shape made literal. The reconciliation-vs-resume guard (`has_langgraph_checkpoint`) is implemented in `state/persistence.py`; `reconcile_orphan_steps` consults it and skips orphans whose workflow has a live LangGraph checkpoint. ADR-002's "or resume" branch (deferred since Phase 1) is now resolved.
+- [x] **STOP #4 — human checkpoint integration (chose Option A).** The `request_drafter_approval` graph node calls `request_checkpoint(...)` via the existing CheckpointSystem (writes the CHECKPOINT_REQUESTED event row + moves workflow to PAUSED) and then `interrupt()`. The existing `agent-habitat checkpoint approve|reject` CLI flips the audit fact. The orchestrator's `resume_crew(workflow_id=...)` reads the resolved checkpoint and passes `Command(resume={"approved": True})` to the graph. Resume idempotency (LangGraph re-executes interrupted nodes from the top) is handled by `_find_latest_drafter_approval`: when a resolved approve_drafter checkpoint already exists, the node short-circuits without writing a duplicate CHECKPOINT_REQUESTED row. ADR-006 §1.4's code is the spec — implemented verbatim. CheckpointSystem itself unchanged.
+- [x] `src/agent_habitat/orchestration/crew_state.py` — `CrewState` TypedDict (total=False) with one key per agent output + `workflow_id` / `company_name` / `drafter_approved` / `terminate_reason`. Three `TERMINATE_REASON_*` constants distinguish the three structurally-distinct empty-outcomes (`score_gated`, `coverage_gated`, `rejected`).
+- [x] `src/agent_habitat/orchestration/crew_graph.py` — factory `build_crew_graph(conn, rubric, *, saver, ...)` closes over the audit conn and rubric; adapters for the four agent nodes wrap Layer A in `run_step` with hard-coded step indices (1-4); `request_drafter_approval` + `terminate_no_draft` are non-agent nodes (no `run_step`). Two conditional edges: after the scorer (gated → terminate_no_draft, else → request_drafter_approval), and after request_drafter_approval (approved → drafter, rejected → terminate_no_draft). Public entry points `run_crew` (initial) and `resume_crew` (after approve/reject) own the workflow lifecycle: insert_workflow → emit workflow.started → invoke graph → finalise COMPLETED / PAUSED / CANCELLED / FAILED. `CrewResult` mirrors the per-agent `*Result` shape for consistency.
+- [x] `src/agent_habitat/state/persistence.py` — `has_langgraph_checkpoint(conn, workflow_id)` queries `checkpoints` by thread_id (defensive `sqlite3.OperationalError` swallow when the table doesn't exist yet, matching Slice 2 behaviour on a pre-orchestrator DB). `reconcile_orphan_steps` consults the guard before marking an orphan FAILED; logs `skipped_for_resume` step ids for audit.
+- [x] `src/agent_habitat/cli.py` — `agent-habitat run-crew COMPANY_NAME [--db PATH] [--rubric PATH]` initial run; `agent-habitat run-crew --resume WORKFLOW_ID [...]` resume. The two modes are mutually exclusive (Click usage error). PAUSED output prints the exact `checkpoint approve` + `run-crew --resume` commands the operator needs. Decision-support footer (CREW_DECISION_FOOTER) carries the same coverage-aware disclosure as Slice 5's Drafter footer + explicitly names the substring-grounding check as a Slice 7 responsibility.
+- [x] `tests/test_crew_graph.py` — 21 deterministic tests: CrewState structural; graph compile (six expected node names registered); initial run PAUSED + step rows + pending checkpoint shape + monotonic step indices; score-gated path → terminate_no_draft → COMPLETED (no drafter LLM call, no checkpoint row); approve_checkpoint + resume → COMPLETED + Draft + resume idempotency (exactly one CHECKPOINT_REQUESTED row); reject_checkpoint + resume → CANCELLED without re-invoking graph; infrastructure error (researcher raises) → FAILED + correct error_step; infrastructure error AFTER resume (drafter raises) → FAILED; reconciliation guard (orphan with live checkpoint NOT touched; orphan without IS marked FAILED; fresh DB returns False from `has_langgraph_checkpoint`); cross-session resume (file-backed DB, close + reopen connections three times, completion verified); audit projection (workflow.completed event carries `produced_draft` + `terminate_reason`; checkpoint payload includes the ScoredCompany); 5 CLI tests (PAUSED output, gated output, mutual-exclusion error, missing-company error, end-to-end resume via CLI).
+- [x] Two live smokes (`@pytest.mark.live`) — see "Phase 2 Slice 6 Live Smoke Calibration" below.
+- [x] **The five existing agent test files were NOT touched.** `test_researcher.py`, `test_extractor.py`, `test_scorer.py`, `test_summarizer.py`, and `test_drafter.py` all pass unchanged through Slice 6. `test_node_pure.py` (the Layer A purity contract from the pre-orchestrator refactor) also passes unchanged. `test_run_step.py` is unchanged. `llm.py` is unchanged. The four Layer A node functions in `agents/researcher.py` / `extractor.py` / `scorer.py` / `drafter.py` are unchanged. `checkpoint/system.py` is unchanged.
+
+## Phase 2 Slice 6 Live Smoke Calibration
+
+Two live smokes on 2026-05-14, both against `data/state/agent_habitat.db`:
+
+**Smoke 1 — full chain end-to-end against `Anthropic` (researcher: Haiku + web_search; extractor + scorer: Sonnet; drafter: Opus 4.7).** PAUSED at the human checkpoint (the live extractor produced enough non-gap fields for the scorer to return a passing ScoredCompany this run); approved via `CheckpointSystem.approve_checkpoint`; resumed; Opus 4.7 produced a 4-claim, 938-char draft.
+  - Researcher: $0.025468
+  - Extractor : $0.008781
+  - Scorer    : $0.006426
+  - Drafter   : $0.063915
+  - **Total: $0.104590** — slightly under Slice 5's $0.135 four-agent estimate (smaller researcher cost this run).
+  - Wall time: ~24s end-to-end across the two graph invocations.
+  - Workflow row + four step rows + cost rolled up correctly; one `checkpoint.requested` + one `checkpoint.approved` + one `workflow.completed` event row.
+
+**Smoke 2 — cross-session resume with a real Opus drafter (upstream agents mocked to force PAUSED deterministically).** Session 1: run_crew with mocked researcher/extractor/scorer → PAUSED. Close conn + saver_conn. Session 2: fresh conn → approve_checkpoint. Close. Session 3: fresh conn + fresh saver_conn → resume_crew with the live Opus drafter → COMPLETED + 5-claim, 762-char Draft for $0.057495. This validates that SqliteSaver's `checkpoints` table state + ADR-002's audit tables both survive a process death AND the orchestrator can pick up exactly where it left off. The crew step row count (4) is identical to a same-process run.
+
+**Live-LLM variability finding (calibration data).** During Slice 6 development a PRIOR live invocation of the full chain on `Anthropic` saw the live extractor return all-gaps (4 of 5 fields `field_not_in_signals`, 1 `span_not_grounded`), driving the workflow into the `score_gated` terminate_no_draft path. The SUBSEQUENT live invocation (Smoke 1 above) on the same company produced a passing ScoredCompany. Both outcomes are structurally valid under ADR-006 §1's empty-outcome contract; the variance is real Sonnet extraction non-determinism. Slice 8 calibration should record the rate; for now Smoke 1 is designed to accept either outcome (PAUSED→Draft or COMPLETED-gated) so the smoke remains green when the LLM goes conservative.
+
+**Drafter substring-failure findings (preserved for Slice 7).** The Slice 5 first-contact live smoke produced two paraphrase-not-substring violations on Opus 4.7's drafter output: (a) "Anthropic PBC is in early talks…" → "Anthropic is in early talks…" (dropped corporate suffix), (b) "Anthropic teamed with the Gates Foundation…" → "partnership with the Gates Foundation…" (synonym substitution). Both are factually faithful, neither is verbatim. The Slice 7 critic's red-team smoke must verify the pure-Python substring check (whitespace-collapse + lowercase normalisation) rejects BOTH patterns. The bounded-retry edge (ADR-006 §1: first violation → drafter retry with critic feedback appended) is what the chain depends on; Slice 7's calibration should record the second-pass behaviour.
 
 ## Phase 2 Slice 5 Subtasks (Drafter + Draft model + DraftClaim)
 - [x] `agents/models.py` extension — `DraftClaim` (per-claim carrier:
@@ -633,8 +674,79 @@ Slice 7 calibration story / README:
 - **Slice 3 "daily" definition resolved: UTC calendar day.** "Daily budget cap" = the half-open interval `[today 00:00:00 UTC, tomorrow 00:00:00 UTC)`. Caps reset at UTC midnight. Why UTC over rolling-24h or local-tz: aligns with the JSONL telemetry directory layout (`data/logs/YYYY-MM-DD/` already UTC), is trivially auditable, and makes window queries simple ISO-string range comparisons. Revisit if a workload needs per-tenant local-tz semantics.
 - **`MAX_PROMPT_CHARS` truncation — visibility resolved; chunk-and-stitch still ADR-gated.** Visibility half RESOLVED (2026-05-14, post-Slice-7 surgical fix): `SummarizerResult` now carries `input_truncated` + `original_chars`/`used_chars`/`dropped_chars`, and the summarize step's `step.completed` event records the same keys additively in `structured_data` (only when truncation actually fired — no false-positive keys on under-limit input). Live-smoke confirmed on https://en.wikipedia.org/wiki/Anthropic: 45,079 → 12,000 chars, dropped 33,079, run still COMPLETED, signal visible end-to-end. Same instinct as `LLMResult.stop_reason` (Slice 2) applied to the INPUT side. What remains: whether to chunk-and-stitch (summarise sections, then summarise the summaries) so a heavy page is actually fully covered rather than just transparently truncated — that is a behaviour/cost change, ADR-worthy, and queued for the Phase 2 Slice 1 crew-architecture ADR. The MAX_PROMPT_CHARS *value* (12,000) is a separate tuning question; the visibility data this fix generates is what should inform it. Source: Slice 7 live calibration finding #1, recorded in README; visibility commit references this entry.
 - **`run_step()` utility — IMPLEMENTED 2026-05-14.** `src/agent_habitat/orchestration/run_step.py` ships the `StepRecorder` dataclass + `run_step()` context manager exactly per ADR-006 §2. Summarizer retrofitted onto it in the same commit; 20 deterministic tests in `tests/test_run_step.py`; all 196 deterministic tests pass; live smoke confirmed. Cosmetic trim (docstring, section dividers, WORKFLOW_TYPE/AGENT_NAME inlined) rode along. summarizer.py: 645 → 391 lines.
+- **LangGraph msgpack deserialisation deprecation (Phase 3+ trigger).** SqliteSaver currently round-trips Pydantic models (`RawSignals`, `CompanyProfile`, `ScoredCompany`, `Draft`) through msgpack but logs `Deserializing unregistered type … from checkpoint. This will be blocked in a future version. Set LANGGRAPH_STRICT_MSGPACK=true to block now, or add to allowed_msgpack_modules to allow explicitly`. Slice 6's deterministic tests + both live smokes round-trip these models successfully today — the warning is forward-looking, not a current failure. When LangGraph flips the default to strict, register the allowed module list explicitly OR serialise CrewState's Pydantic payloads to dicts at the node boundary (`.model_dump(mode='json')`) and re-validate on read. Trigger: a LangGraph minor-version upgrade that flips `LANGGRAPH_STRICT_MSGPACK` to true by default. Not blocking Slice 7.
 
 ## Last Session
+**Phase 2 Slice 6 — LangGraph orchestrator + SqliteSaver + cross-
+session resume.** Opus 4.7 xHigh — the one slice of the project that
+genuinely warrants the maximum-reasoning tier (hard reasoning under
+high rework cost, five interconnected agents being wired into one
+state machine, four named STOP-AND-DECIDE forks). All four STOPs were
+hit and resolved before any code:
+
+- STOP #1 (scope): four nodes wired, no critic, no calibration, no
+  CLI split, no summarizer. ADR-006 §1's topology confirmed.
+- STOP #2 (persistence ownership): Option A — orchestrator owns the
+  workflow row; node adapters use `run_step` directly (already step-
+  only per ADR-006 §2). Existing Layer B wrappers UNCHANGED. No ADR-
+  002 addendum required. The audit shape ADR-002 specifies survives.
+- STOP #3 (SqliteSaver coexistence + reconciliation guard): verified
+  live that SqliteSaver creates `checkpoints` + `writes` tables in the
+  same .db file without colliding with ADR-002's three tables;
+  `thread_id = workflow_id` as uuid hex works as opaque text; two
+  `sqlite3.Connection`s open the same file (audit conn with
+  `check_same_thread=True`, SqliteSaver conn with `=False`).
+  `has_langgraph_checkpoint` + the new `reconcile_orphan_steps`
+  behaviour close the "or resume" branch ADR-002 §1 left open since
+  Phase 1.
+- STOP #4 (human checkpoint): Option A — LangGraph `interrupt()`
+  inside `request_drafter_approval` calling the existing CheckpointSystem;
+  ADR-006 §1.4 code is the spec. Resume idempotency handled by
+  short-circuiting the node when a resolved checkpoint already exists
+  (LangGraph re-executes interrupted nodes from the top).
+
+**Implementation surface.** Three new files:
+`src/agent_habitat/orchestration/crew_state.py` (TypedDict),
+`crew_graph.py` (StateGraph + adapters + run_crew / resume_crew),
+`tests/test_crew_graph.py` (21 deterministic + 2 live). Two extended
+files: `state/persistence.py` (the reconciliation guard), `cli.py`
+(the `run-crew` command + `--resume` mode). One pyproject.toml
+dependency bump (`langgraph>=1.2,<2`, `langgraph-checkpoint-sqlite>=3.1,<4`).
+Zero changes to the four Layer A node functions; zero changes to the
+five existing agent test files; zero changes to `llm.py`,
+`run_step.py`, ADR-002's schema, `checkpoint/system.py`, or the agent
+models.
+
+**Live smoke produced the first end-to-end crew Draft.** Real
+Researcher (Haiku + web_search) → real Extractor (Sonnet) → real
+Scorer (Sonnet) → PAUSED → approved → real Drafter (Opus 4.7) → 4-
+claim Draft on Anthropic for $0.105. Cross-session resume validated
+in a second smoke with mocked upstream + live Opus drafter: paused
+in session 1, closed all connections, approved via fresh conn in
+session 2, resumed via fresh conn + fresh SqliteSaver in session 3,
+produced a 5-claim Draft for $0.057. Both smokes green; full audit
+chain (workflow row + 4 step rows + cost rolled up + events
+narrative) intact across the cross-session boundary. The four
+existing Phase 2 agent test files (and Layer A pure tests, and
+run_step tests) all pass unchanged — Slice 6 is purely additive on
+the agent surface.
+
+**Live-LLM variability finding (calibration data for Slice 8).** An
+earlier live invocation of Smoke 1 on Anthropic saw the live
+extractor return all-gaps and the workflow took the `score_gated`
+terminate_no_draft path. The later invocation extracted enough to
+pass. Both are structurally valid; Smoke 1 is designed to accept
+either outcome so the smoke remains green under real LLM
+non-determinism. Smoke 2 mocks the upstream chain specifically so
+the cross-session resume mechanism is tested independently of that
+variability.
+
+**Drafter substring failures from Slice 5 — PRESERVED for Slice 7.**
+The "Anthropic PBC" / "teamed with" findings are intact in the
+Slice 6 STATUS section above; Slice 7's red-team smoke is the
+documented next responsibility.
+
+## Prior Session
 **Phase 2 Slice 5 — Drafter agent + Draft / DraftClaim models.**
 Opus 4.7 high, building one new agent against the post-refactor Layer A
 / Layer B template (Layer A `drafter_node` is DB-pure; Layer B
@@ -1332,42 +1444,64 @@ Slice 3's actual new work (per the kickoff prompt) was the budget-check + halt-s
 Tests: 40 deterministic tests in `tests/test_budget.py` — pure evaluator across boundary/edge cases (zero cap, threshold=0, threshold=1, at-cap, at-threshold); UTC window correctness including tz conversion and naive-datetime defensive path; `cost_within_window` inclusion/exclusion at boundaries and isolation across workflows; end-to-end check with override resolution; exceed-event row shape; halt-signal query including the "unrelated error event must not trip the halt" anti-confusion case; TOML config loading including missing file, malformed TOML, missing required key, missing [defaults] section, override without `daily_cap_usd`, threshold out of range, and a sanity-check that the bundled `config/budgets.toml` loads. Full suite (90 tests including llm.py and state) passes cleanly. ruff check + ruff format + mypy strict all clean.
 
 ## Next Session Entry Point
-**Phase 2 Slice 6 — LangGraph orchestrator.** All five Phase 2 agents
-now exist as Layer A pure node functions (researcher / extractor /
-scorer / drafter; the summarizer is a Phase 1 demo, not a crew node).
-Slice 6 wires them into the LangGraph `StateGraph(CrewState)` per
-ADR-006 §1, installs `langgraph-checkpoint-sqlite` for cross-session
-checkpoint resume, and implements the `request_drafter_approval` node
-that bridges LangGraph's `interrupt()` to the existing CheckpointSystem.
-The Slice 5 Drafter is wired in directly — its `drafter_node` Layer A
-is the LangGraph node body, with `run_step` providing the audit
-envelope. Conditional edges land for the empty-outcome paths
-(`terminate_no_draft` for gated ScoredCompany, `halt` for
-infrastructure failure).
+**Phase 2 Slice 7 — Critic agent (Haiku) + pure-Python substring
+check + bounded fabrication-retry edge.** ADR-006 §3 is the spec.
+Two new modules:
 
-**Slice 7 — Critic — also unblocked AND has a load-bearing calibration
-input ready.** The Slice 5 live smoke produced the first concrete
-fabrication evidence (Anthropic over-reaches, see "Phase 2 Slice 5
-Live Smoke Calibration"). Slice 7 builds `agents/critic.py` (Haiku)
-+ `agents/fabrication.py` (pure-Python substring check) per ADR-006 §3,
-and the red-team smoke must explicitly verify the substring check
-rejects: (a) dropped corporate suffix ("Anthropic PBC" →
-"Anthropic"), (b) synonym substitution ("teamed with" →
-"partnership with"). Both are real Opus 4.7 over-reaches captured on
-the Slice 5 first-contact smoke; both pass the "factually faithful"
-human eye test; both fail the substring check. The Slice 5 evidence
-shows the Critic is necessary, not optional.
+- `agents/critic.py` — `critic_node(state)` reads
+  `(draft, raw_signals, profile, scored_company)` from CrewState and
+  emits a `Critique(claims=[...], violations=[...], passes=bool)` via
+  one Haiku call (claim-decomposition only; the LLM does NOT do the
+  grounding judgment — see next module). Wrap in `run_step` per ADR-
+  006 §2 with step_index=5.
+- `agents/fabrication.py` — pure-Python `substring_check(critique,
+  state) -> Critique` function that re-runs the substring grounding
+  (whitespace-collapse + lowercase normalisation, the existing
+  `_normalise_for_substring` from extractor.py) against the union of
+  `(raw_signals.signals[].text, profile.<field>.source_spans[].quote,
+  scored_company.dimensions[].grounded_quote)`. If the check disagrees
+  with the critic's `passes`, the check WINS and the disagreement is
+  itself a violation. This pure function is what makes the contract
+  AUDITABLE: an auditor can re-run it from cold storage with no LLM call.
 
-**Recommendation — Slice 6 first, then Slice 7.** Reasons: (a) Slice 6
-is the integration moment that proves the Layer A / Layer B split was
-correct (the four existing agents wrap unchanged into LangGraph nodes;
-the new Drafter does too); (b) Slice 7's critic depends on the
-LangGraph state shape having all upstream agent outputs reachable from
-the critic node — Slice 6 commits that shape; (c) building the critic
-into a half-built orchestrator would force a second integration pass
-later. But the ordering is reversible — the Critic can land standalone
-against synthetic ScoredCompany / Draft fixtures (the Slice 5 over-
-reach evidence is replayable from the recorded JSONL).
+**Orchestrator integration (extends Slice 6's crew_graph.py).** Two
+new graph features:
+- Add a sixth node `critic` between `drafter` and `END`, wrapped in
+  `run_step` step_index=5. Conditional edge from drafter → critic.
+- Add the bounded fabrication-retry edge: conditional from critic.
+  On first violation (`fabrication_retries == 0`): set
+  `fabrication_retries=1`, append the critic's violations to the
+  drafter's input, route back to drafter. On second violation: emit
+  `agent.fabrication_detected` at ERROR level, route to halt,
+  workflow FAILED.
+- CrewState gains two new keys: `critique: Critique`,
+  `fabrication_retries: int` (default 0).
+
+**Red-team smoke (LOAD-BEARING — see "Phase 2 Slice 6 Live Smoke
+Calibration" above, "Drafter substring-failure findings").** The
+Slice 5 first-contact live smoke produced two paraphrase-not-
+substring violations on Opus 4.7: (a) "Anthropic PBC" → "Anthropic"
+(dropped corporate suffix), (b) "teamed with" → "partnership with"
+(synonym substitution). Both are factually faithful, neither is
+verbatim. Slice 7's red-team smoke MUST verify the substring check
+catches both patterns when injected into a synthetic Draft against a
+known-good ScoredCompany. This is the auditable-contract validation.
+
+**Slice 7 must NOT touch.** ADR-002's schema is unchanged
+(`agent.fabrication_detected` already exists in the EventType
+taxonomy). The four Phase 2 Layer A nodes are unchanged. Slice 6's
+crew_graph.py extends additively (new critic node + new conditional
+edges); the existing four-node topology + checkpoint + resume
+mechanism is preserved.
+
+**Slice 8 — Live calibration across 3-5 companies — remains the
+follow-up.** Two forward dependencies queued from ADR-003 and ADR-
+006: `budgets.toml` re-validation (Slice 5's $0.135/4-agent number +
+Slice 6's $0.105/4-agent number — both within ADR-006 §1's estimate;
+the full 5-agent number from Slice 7 + Slice 8 should land
+$0.14-$0.16), and ADR-006 §1's checkpoint-cost-rationale prose
+re-check (upstream-chain figure was ~5× understated against the
+recalibrated researcher cost).
 
 **Two forward dependencies remain queued for Slice 8** (Open Questions):
 `budgets.toml` re-validation against real end-to-end cost (now with

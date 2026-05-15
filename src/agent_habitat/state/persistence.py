@@ -373,18 +373,45 @@ def recompute_cost_total(conn: sqlite3.Connection, workflow_id: str) -> float:
 
 # Contract resolved (ADR-002 underspecified what "reconcile" means without the
 # orchestrator wired). ADR-002 says orphaned in-progress steps reconcile to
-# "failed with a synthesized event, or resume." The "or resume" branch requires
-# LangGraph checkpoint state to decide whether resume is safe — that wiring
-# does not exist until Phase 2's orchestrator lands. Slice 2 therefore
-# implements the deterministic half: mark every orphan FAILED with
-# finished_at=now, error_message naming the sweep, and a synthesized
-# events row at level=WARN. The resume branch is a Phase 2 extension that
-# layers on top of this (call reconcile_orphan_steps first, then attempt
-# resume from LangGraph checkpoint state for any newly-failed steps the
-# orchestrator can recover).
+# "failed with a synthesized event, or resume." The "or resume" branch
+# previously required infrastructure that Slice 2 lacked; Phase 2 Slice 6
+# wires LangGraph's SqliteSaver into the same .db file, so we can finally
+# distinguish "lost" from "resumable" — see `has_langgraph_checkpoint` and
+# the Slice 6 STOP #3c reconciliation guard.
 
 ORPHAN_ERROR_MESSAGE = "orphaned-on-startup: reconciled by reconcile_orphan_steps"
 ORPHAN_EVENT_MESSAGE = "step reconciled from running → failed by startup sweep"
+
+
+def has_langgraph_checkpoint(
+    conn: sqlite3.Connection,
+    workflow_id: str,
+) -> bool:
+    """True iff SqliteSaver has at least one checkpoint row for this thread_id.
+
+    ADR-002 Option 1: SqliteSaver writes the `checkpoints` table to the
+    SAME `.db` file as the audit tables, keyed on `thread_id` =
+    `workflow_id`. `reconcile_orphan_steps` consults this to decide
+    whether an orphan step belongs to a workflow that can be RESUMED
+    from a live checkpoint (skip — orchestrator owns it) vs lost
+    (mark FAILED — Slice 1 deterministic behaviour).
+
+    The `checkpoints` table may not exist on a fresh DB (SqliteSaver
+    creates it on first `setup()`). Treat `no such table` as "no live
+    checkpoint" so this function is safe to call on pre-orchestrator
+    databases — matching the Slice 2 reconciliation behaviour exactly
+    when no orchestrator has ever run.
+    """
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM checkpoints WHERE thread_id = ? LIMIT 1",
+            (workflow_id,),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return False
+        raise
+    return row is not None
 
 
 def reconcile_orphan_steps(
@@ -397,6 +424,12 @@ def reconcile_orphan_steps(
     — i.e. a step that started but never completed, the signature of a
     crashed or hard-killed run. Per ADR-002's recovery design, these need
     to be reconciled before any new work proceeds.
+
+    Slice 6 STOP #3c — reconciliation-vs-resume guard. Orphans whose
+    workflow has a live LangGraph checkpoint (`has_langgraph_checkpoint`)
+    are LEFT ALONE: the Phase 2 orchestrator can RESUME from that
+    checkpoint instead of declaring the workflow lost. Orphans without a
+    live checkpoint reconcile FAILED exactly as in Slice 2.
 
     Returns the list of step ids that were reconciled (empty if none).
 
@@ -418,9 +451,16 @@ def reconcile_orphan_steps(
         return []
 
     reconciled_ids: list[int] = []
+    skipped_for_resume: list[int] = []
     with conn:
         for row in rows:
             step_id = int(row["id"])
+            workflow_id = str(row["workflow_id"])
+            if has_langgraph_checkpoint(conn, workflow_id):
+                # Resume-capable: do not reconcile. The orchestrator
+                # consumes the live LangGraph state on resume.
+                skipped_for_resume.append(step_id)
+                continue
             conn.execute(
                 """
                 UPDATE workflow_steps
@@ -438,7 +478,7 @@ def reconcile_orphan_steps(
                 ) VALUES (?, ?, ?, 'warn', ?, ?)
                 """,
                 (
-                    row["workflow_id"],
+                    workflow_id,
                     step_id,
                     ts,
                     ORPHAN_EVENT_MESSAGE,
@@ -458,5 +498,6 @@ def reconcile_orphan_steps(
         "state.reconcile.orphans_swept",
         count=len(reconciled_ids),
         step_ids=reconciled_ids,
+        skipped_for_resume=skipped_for_resume,
     )
     return reconciled_ids

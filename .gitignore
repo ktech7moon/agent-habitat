@@ -10,6 +10,8 @@ data/state/*.db
 data/state/*.db-wal
 data/state/*.db-shm
 data/logs/*.jsonl
+data/logs/**/*.jsonl
+data/logs/[0-9]*/
 .env
 *.egg-info/
 build/

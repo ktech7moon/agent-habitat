@@ -4,15 +4,69 @@
 Phase 2 — 5-Agent Lead Enrichment Crew (full plan: docs/ROADMAP.md)
 
 ## Current Slice
-Phase 2 Slice 3 — Extractor agent + `CompanyProfile` + `ExtractionGap` +
-source-span refs **— COMPLETE 2026-05-14**. Live smoke passed against
-`Anthropic`; full Researcher→Extractor round-trip resolved; the substring
-grounding validator caught TWO real over-reaches in the wild (`industry`
-and `tech_stack` were proposed by the model with quotes that did not
-substring-match the cited signals — both downgraded to
-`span_not_grounded` gaps). Phase 2 Slice 4 (Scorer) is next; ADR-004
-(ICP rubric format) must land BEFORE Slice 4 starts. Phase 1 remains
-shippable.
+**ADR-004 — ICP rubric format and missing-data handling: ACCEPTED
+2026-05-14.** Phase 2 Slice 4 (Scorer) is now UNBLOCKED. The
+rubric TOML mirrors `config/budgets.toml`'s idiom ([defaults] + per-
+dimension override sections). The load-bearing decision is the
+missing-data handling: a `ProfileField` that is an `ExtractionGap` is
+EXCLUDED from the score and its weight is dropped from the
+denominator; the composite `score` is renormalised over the present
+dimensions, and a parallel `coverage` number (fraction of total
+rubric weight that was scorable) rides alongside. **ADR-006 §1's
+floor gates on `score`**; `min_coverage` is an OPTIONAL second gate
+(default 0.0 — off) operators turn up as confidence grows.
+**Grounding chain extends through the Scorer**: every per-dimension
+reasoning carries a `grounded_quote` that must substring-match one
+of the cited ProfileField's `source_spans` (whitespace-collapse +
+lowercase normalised) — the same pure-Python check shape Slice 3
+established. Phase 2 Slice 3 (Extractor) remains DONE 2026-05-14.
+Phase 1 remains shippable.
+
+## Phase 2 ADR-004 Highlights
+- **TOML format mirrors `budgets.toml`'s idiom.** `[defaults]` for
+  global tunables (`floor`, `tier_a_min`/`tier_b_min`/`tier_c_min`,
+  `min_coverage`, `missing_data_policy`); `[dimensions.<name>]` per
+  scoring dimension (one dimension scores exactly one
+  `PROFILE_FIELD_NAMES` field; weights MUST sum to 1.0; `prose` is
+  the operator-authored rubric the LLM applies).
+- **Missing-data handling: renormalise-with-coverage.** Gap-excluded
+  dimension's weight drops from denominator; `score` reflects rubric
+  quality on covered dimensions; `coverage` flags the operator that
+  ranking is unreliable when coverage is low. Rejected: gap=0 (makes
+  every Slice-3-typical 4/5-gap input route to terminate_no_draft —
+  habitat becomes useless), and collapsed-composite (`score × coverage`
+  — dual-source-of-truth failure, can't tune the two effects
+  independently).
+- **`score` is the number ADR-006 §1's floor gates on.** Routing
+  contract unchanged. The optional `min_coverage` second gate adds
+  `gated_by = "coverage"` vs `gated_by = "score"` to the
+  `step.completed` projection so the calibration story can tell the
+  two empty-outcomes apart.
+- **Grounding chain extends through the Scorer.** Per-dimension
+  reasoning carries a `grounded_quote` which must substring-match
+  (whitespace-collapse + lowercase normalised) one of the cited
+  field's `source_spans` quotes. Pure-Python check; same shape Slice
+  3 established. Five-hop chain now: `Citation.cited_text →
+  Signal.text → ProfileField.source_spans → ScoredCompany.grounded_quote
+  → Draft claim`, each hop a substring of the previous. Slice 7
+  Critic inherits this chain unchanged.
+- **Scoring mechanism: LLM-as-judge against a prose rubric** (not
+  pure-deterministic keyword lists, not hybrid). The audit-grade
+  posture is achieved by grounding (substring check on
+  `grounded_quote`), not by avoiding the LLM — the consistent move
+  across ADR-003, ADR-006 §3, ADR-004.
+- **Honest limitation surfaced:** the rubric is an un-validated
+  operator hypothesis. agent-habitat has no CRM and no closed-won
+  dataset; the industry's "tune against 50 closed-won deals" step
+  does not exist here. The substitute is Slice 8 calibration —
+  record per-company human-judged fit vs rubric score and surface
+  disagreements. The ADR documents this honestly rather than
+  pretending the rubric is data-validated.
+- **`config/rubric.toml` shipped as a clearly-marked format
+  template** (banner comment: "NOT a real tuned rubric"). Five
+  example dimensions with placeholder weights summing to 1.0 +
+  illustrative prose. The operator replaces the values; the format
+  is the ADR-004 contract.
 
 ## Phase 2 Slice 3 Subtasks (Extractor + CompanyProfile + ExtractionGap)
 - [x] `agents/models.py` extension — `SourceSpan`, `ExtractionGap`, `ProfileField` (mutually-exclusive value-or-gap with model_validator), `CompanyProfile` (5 fields: size / industry / tech_stack / recent_news / decision_makers). Every model `ConfigDict(extra="forbid", frozen=True)`. `PROFILE_FIELD_NAMES` tuple is the canonical iteration order.
@@ -284,6 +338,36 @@ Slice 7 calibration story / README:
 - **`run_step()` utility — IMPLEMENTED 2026-05-14.** `src/agent_habitat/orchestration/run_step.py` ships the `StepRecorder` dataclass + `run_step()` context manager exactly per ADR-006 §2. Summarizer retrofitted onto it in the same commit; 20 deterministic tests in `tests/test_run_step.py`; all 196 deterministic tests pass; live smoke confirmed. Cosmetic trim (docstring, section dividers, WORKFLOW_TYPE/AGENT_NAME inlined) rode along. summarizer.py: 645 → 391 lines.
 
 ## Last Session
+**ADR-004 — ICP rubric format and missing-data handling.** Fresh
+session, Opus high, ADR-only. Settled three coupled decisions: (1)
+the TOML wire format mirrors `config/budgets.toml`'s idiom — no
+second config style in the project; (2) the load-bearing
+missing-data policy is renormalise-with-coverage — a gap-shaped
+`ProfileField` excludes its dimension from the score and drops the
+weight from the denominator, and a parallel `coverage` number rides
+alongside `score`; (3) the grounding chain extends through the
+Scorer via a `grounded_quote` substring check, re-using Slice 3's
+normaliser. ADR-006 §1's floor gates on `score`; `min_coverage`
+is an OPTIONAL second gate (default off). Scoring mechanism:
+LLM-as-judge against operator-authored `prose` rubric per
+dimension, audit-grade posture preserved by the grounding chain.
+
+Honest limitation recorded in the ADR: the rubric is an
+un-validated operator hypothesis (no CRM, no closed-won dataset).
+The substitute for the industry's "tune against 50 closed-won
+deals" step is Slice 8 calibration.
+
+File outputs: `docs/adr/ADR-004-icp-rubric-format.md` (new),
+`docs/adr/README.md` (ADR-004 flipped Proposed → Accepted),
+`config/rubric.toml` (clearly-marked format template, NOT a tuned
+rubric), `STATUS.md` updated. No code changes; no `pip install`.
+No `llm.py` / `run_step.py` / `agents/` / `budgets.toml` / ADR-002
+/ ADR-006 changes — the existing contracts hold.
+
+Phase 2 Slice 4 (Scorer) is UNBLOCKED and is the next session's
+work.
+
+## Prior Session
 Phase 2 Slice 3 — Extractor agent + `CompanyProfile` model + ExtractionGap
 pattern + source-span grounding. Built `agents/extractor.py` and extended
 `agents/models.py` with `SourceSpan` / `ExtractionGap` / `ProfileField` /
@@ -650,40 +734,67 @@ Slice 3's actual new work (per the kickoff prompt) was the budget-check + halt-s
 Tests: 40 deterministic tests in `tests/test_budget.py` — pure evaluator across boundary/edge cases (zero cap, threshold=0, threshold=1, at-cap, at-threshold); UTC window correctness including tz conversion and naive-datetime defensive path; `cost_within_window` inclusion/exclusion at boundaries and isolation across workflows; end-to-end check with override resolution; exceed-event row shape; halt-signal query including the "unrelated error event must not trip the halt" anti-confusion case; TOML config loading including missing file, malformed TOML, missing required key, missing [defaults] section, override without `daily_cap_usd`, threshold out of range, and a sanity-check that the bundled `config/budgets.toml` loads. Full suite (90 tests including llm.py and state) passes cleanly. ruff check + ruff format + mypy strict all clean.
 
 ## Next Session Entry Point
-**ADR-004 — ICP rubric format. MUST land before Phase 2 Slice 4 (Scorer)
-starts.** Fresh session, Opus high (architecture decision). The Scorer
-consumes a `CompanyProfile` (Slice 3, DONE) and a TOML-defined ICP rubric
-and emits a `ScoredCompany` (score + threshold + passed_floor + reasoning).
-The rubric format is the operator-tunable knob (CLAUDE.md rule 7:
-"operator tunes outcomes; developers tune prompts"); the shape of the
-TOML is an ADR-grade decision because every Scorer implementation choice
-follows from it. Alternatives to weigh in the ADR:
+**Phase 2 Slice 4 — Scorer agent + `ScoredCompany` model + rubric
+loader.** Fresh session, Opus high (slice implementation). ADR-004
+(`docs/adr/ADR-004-icp-rubric-format.md`) is the blueprint.
 
-- Weighted feature scoring (per-field weight + threshold) — simple, fully
-  TOML-defined, no LLM judgment beyond profile-to-feature mapping.
-- LLM-as-judge against a prose rubric — TOML carries instructions; the
-  LLM emits a numeric score with reasoning. Higher-fidelity, less
-  auditable.
-- Hybrid (deterministic feature score + LLM commentary) — most projects
-  end up here; ADR should weigh whether Phase 2's audit-grade posture
-  justifies the deterministic-first shape.
+Slice 4 scope (from ADR-004's "Forward dependencies handed to Slice
+4" section):
+- Build the `ScoredCompany` Pydantic v2 model. Required carry:
+  `score`, `coverage`, `floor`, `min_coverage`, `passed_floor`,
+  `passed_coverage`, `tier`, `gated_by | null`, and a
+  `dimensions: list[DimensionScore]` where each `DimensionScore`
+  carries `field`, `weight`, `score | None`, `grounded_quote | None`,
+  `reasoning`.
+- Implement `src/agent_habitat/agents/scorer.py` —
+  `run_scorer(conn, *, profile, rubric_path, ...)`. Sonnet tier via
+  `llm.complete()` (no `llm.py` change expected — re-use the
+  Extractor's structured-output method: schema-in-system-prompt +
+  `model_validate_json(LLMResult.content)` per
+  `docs/adr/ADR-004-icp-rubric-format.md` §5 + "Forward
+  dependencies"). Wire through `run_step()` per ADR-006 §2.
+- Implement a small rubric loader. On load: validate weights sum to
+  1.0; every `field` is in `PROFILE_FIELD_NAMES`; tier thresholds
+  form a valid `tier_a_min > tier_b_min > tier_c_min >= floor`
+  ordering; `missing_data_policy = "renormalise"` (only option in
+  Phase 2). Bundled `config/rubric.toml` is the format template;
+  Slice 4 wires up the loader against it.
+- Implement the missing-data renormalisation logic (ADR-004 §2):
+  iterate dimensions in `PROFILE_FIELD_NAMES` canonical order; for
+  each, check `ProfileField.is_gap`; if gap, exclude (record
+  `score=null`, drop weight from denominator); else LLM-score against
+  the dimension's `prose` and the field values, require a
+  `grounded_quote`, run the substring check (re-use Slice 3's
+  whitespace/case normalisation helper — do NOT invent a second
+  normaliser).
+- Empty / all-gaps `CompanyProfile` is a valid input: `score`
+  undefined (no dimensions covered), `coverage = 0.0`,
+  `passed_floor = false`, route to `terminate_no_draft` regardless.
+- Mirror `{score, coverage, floor, min_coverage, passed_floor,
+  passed_coverage, tier, gated_by | null}` onto `step.completed`.
+- CLI: `agent-habitat run-scorer COMPANY_NAME [--db PATH]
+  [--rubric PATH] [--max-searches N] [--*-workflow-id ID]` —
+  sequences Researcher → Extractor → Scorer as three separate
+  workflows (Slice 6's orchestrator unifies them); decision-support
+  footer with the `coverage` number explicitly surfaced (ADR-004 §2
+  + PATTERNS.md #4).
+- Deterministic tests for: rubric loader (weights-sum, field
+  validity, tier ordering, missing keys, malformed TOML, default
+  `min_coverage`); per-dimension scoring including gap exclusion;
+  composite score renormalisation; coverage computation; substring
+  grounding pass + over-reach reject; floor + min_coverage gating
+  (both gates, score-only, coverage-only); tier assignment; empty
+  / all-gaps profile path; infrastructure failure (malformed JSON
+  / bad schema); CLI happy + researcher/extractor/scorer failures.
+- One live smoke against a real `CompanyProfile` from Slice 3's
+  pipeline. Record the per-dimension calibration table in STATUS.md
+  — score-vs-coverage spread is the headline finding; record cost
+  and wall-time too.
+- Full suite + ruff check + ruff format --check + mypy strict must
+  all be clean.
 
-Once ADR-004 lands, Slice 4 (Scorer) can build against it: Sonnet tier
-per ADR-006; mirror `{score, threshold, passed_floor}` onto
-`step.completed`; below-floor result routes via conditional edge to
-`terminate_no_draft` (orchestrator's job in Slice 6 — Slice 4 just emits
-the signal).
-
-The Slice 3 Extractor + CompanyProfile + ExtractionGap shape is DONE
-and live-validated; the substring-grounding validator caught real
-over-reaches in the wild and is the model for the Slice 7 Critic's
-equivalent check in the drafter→critic direction. ADR-006 §3's
-substring discipline now has both an upstream half (Signal.text from
-cited_text) and a midstream half (ProfileField source-spans grounded
-into Signal.text); the downstream half (Draft claims grounded into the
-union of upstream textual outputs) is Slice 7's contribution.
-
-Two forward dependencies remain queued for Slice 8 (Open Questions):
-`budgets.toml` re-validation against real end-to-end cost, and ADR-006
-§1's checkpoint-rationale prose re-check (upstream-chain cost figure is
-~5× understated). Neither blocks Slice 4.
+Two forward dependencies remain queued for Slice 8 (Open
+Questions): `budgets.toml` re-validation against real end-to-end
+cost, and ADR-006 §1's checkpoint-rationale prose re-check
+(upstream-chain cost figure is ~5× understated). Neither blocks
+Slice 4.

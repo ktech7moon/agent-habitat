@@ -1,0 +1,136 @@
+# agent-habitat — ICP rubric (operator-tunable scoring).
+#
+# THIS IS A FORMAT TEMPLATE, NOT A REAL TUNED RUBRIC. The dimension
+# `prose` values below are placeholder examples authored to illustrate
+# the format established by ADR-004. Replace them with your actual
+# Ideal Customer Profile before relying on the score for any decision.
+# The format itself (sections, keys, value types) is the ADR-004
+# contract; the contents are yours to tune.
+#
+# Mirrors `config/budgets.toml`'s idiom (ADR-004 §1):
+#   [defaults]                  — operator tuning knobs
+#   [<noun>.<name>] sections    — one per scoring dimension
+#
+# Missing-data semantics (ADR-004 §2)
+# -----------------------------------
+# A `CompanyProfile` field that the Extractor returned as an
+# `ExtractionGap` causes its dimension to be EXCLUDED from the score
+# and its weight dropped from the denominator. The composite `score`
+# is renormalised over the present dimensions; a parallel `coverage`
+# number reports the fraction of total rubric weight that was
+# scorable. `floor` (this file) gates on `score`. The optional
+# `min_coverage` gates on `coverage` (default `0.0` — off).
+#
+# Grounding (ADR-004 §3)
+# ----------------------
+# Every per-dimension score the Scorer emits must carry a
+# `grounded_quote` that is a verbatim substring (after
+# whitespace-collapse + lowercase normalisation) of one of the cited
+# ProfileField's `source_spans`. The substring check is pure-Python
+# in `agents/fabrication.py`. Over-reach is a fabrication and is
+# rejected.
+#
+# Weights MUST sum to 1.0 across all dimensions. Slice 4 validates
+# this on rubric load.
+
+[defaults]
+# Gating score below which ADR-006 §1 routes the workflow to
+# `terminate_no_draft` (workflow COMPLETED, no Opus tokens spent).
+# Units: composite renormalised score on a 0–100 scale.
+floor = 55.0
+
+# Optional second gate. If `coverage < min_coverage`, the workflow also
+# routes to `terminate_no_draft`. Default 0.0 disables the gate so only
+# `floor` is consulted. Operators tightening the rubric on real data
+# turn this up as confidence grows.
+min_coverage = 0.0
+
+# Tier thresholds on the composite score (0–100). Must satisfy
+# tier_a_min > tier_b_min > tier_c_min >= floor.
+tier_a_min = 80.0
+tier_b_min = 65.0
+tier_c_min = 55.0
+
+# Missing-data policy. Phase 2 supports `"renormalise"` only. Listed
+# here so the policy is explicit in the audit artefact, not implicit
+# in the Scorer's code.
+missing_data_policy = "renormalise"
+
+# ----------------------------------------------------------------------
+# Dimensions — one section per `CompanyProfile` field scored.
+# Weights MUST sum to 1.0. Each dimension scores exactly one field
+# from `PROFILE_FIELD_NAMES`.
+# ----------------------------------------------------------------------
+
+[dimensions.industry]
+field = "industry"
+weight = 0.30
+prose = """
+Score industry fit on a 0–5 scale for a freelance practice targeting
+production AI agent work in regulated industries:
+  5 — fintech, healthcare, legal/compliance, insurance, regtech
+  3 — adjacent regulated-adjacent: enterprise SaaS, dev tools with
+      compliance customers, B2B platforms with audit needs
+  1 — consumer, gaming, ad-tech, anything with no regulated buyer
+Score the extracted industry values literally; do not infer beyond
+what the source-span quote supports.
+"""
+
+[dimensions.size]
+field = "size"
+weight = 0.20
+prose = """
+Score size fit on a 0–5 scale:
+  5 — Series B / Series C: ~100–500 headcount; enough budget for
+      contract work, small enough that procurement isn't a quarter
+  3 — Seed / Series A (~10–100); or larger growth-stage
+      (~500–2000)
+  1 — pre-seed (<10) or enterprise (>2000)
+Use the extracted size value verbatim; if a span quotes a headcount
+or funding stage, score against it directly.
+"""
+
+[dimensions.tech_stack]
+field = "tech_stack"
+weight = 0.20
+prose = """
+Score technographic fit on a 0–5 scale based on whether the
+extracted tech stack signals an organisation already operating
+AI/agent workloads in production:
+  5 — Python + LangChain/LangGraph/CrewAI/AutoGen; Anthropic /
+      OpenAI / Bedrock usage; vector stores; observability tooling
+  3 — Python ML stack without agent frameworks; or strong general
+      Python/Go/TypeScript backend without AI-specific signals
+  1 — primarily front-end-only stacks; non-engineering tech signals
+Ground scoring strictly in the extracted tech_stack source-span
+quote.
+"""
+
+[dimensions.recent_news]
+field = "recent_news"
+weight = 0.20
+prose = """
+Score intent / trigger fit on a 0–5 scale from extracted recent news:
+  5 — funding round in the last 90 days; AI-team hiring; new product
+      launch citing AI/agents; compliance milestone
+  3 — leadership change, general expansion, partnership news
+  1 — no relevant trigger; news is unrelated or stale
+The extracted recent_news span IS the signal; do not score against
+inferred context not present in the quote.
+"""
+
+[dimensions.decision_makers]
+field = "decision_makers"
+weight = 0.10
+prose = """
+Score decision-maker reachability on a 0–5 scale:
+  5 — a named, contactable senior technical leader (VP Eng, CTO,
+      Head of AI, Director of Platform) appears in the extracted
+      span
+  3 — a named senior non-technical leader (CEO/COO/CFO) — reachable
+      but a longer sales motion
+  1 — no decision-maker named in the extracted span; or only
+      individual-contributor names surfaced
+Smallest weight by intent: missing decision-maker data is the most
+common gap and least correlated with overall fit.
+"""

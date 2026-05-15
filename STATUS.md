@@ -5,8 +5,10 @@ Phase 2 — 5-Agent Lead Enrichment Crew (full plan: docs/ROADMAP.md)
 
 ## Current Slice
 Phase 2 Slice 1 — Crew-architecture ADR **— COMPLETE** (ADR-006 accepted 2026-05-14).
-Phase 1 remains shippable; Slice 8 (optional Phase 1 polish) is queued separately
-and can be picked up anytime without blocking Phase 2.
+ADR-003 (web search tool) **— ACCEPTED 2026-05-14**. Phase 2 Slice 2 (Researcher
+agent) is now fully unblocked. Phase 1 remains shippable; Slice 8 (optional
+Phase 1 polish) is queued separately and can be picked up anytime without
+blocking Phase 2.
 
 ## Slice 1 Subtasks
 - [x] Scaffold project skeleton + plan docs
@@ -112,6 +114,46 @@ Slice 7 calibration story / README:
 - **`run_step()` utility — design RESOLVED in ADR-006 §2; implementation queued for Phase 2 Slice 2.** ADR-006 commits to a context-manager utility at `src/agent_habitat/orchestration/run_step.py` (the package exists but is empty; this is its first occupant) with explicit `record_cost` / `record_output_ref` / `record_structured_data` verbs on a yielded `StepRecorder`. Lifecycle = open RUNNING step row → emit step.started → yield → finalise COMPLETED with the recorder's accumulated cost/output_ref/structured_data on normal exit; on exception, finalise FAILED with `error_message` + emit step.failed, re-raise. No LangGraph dependency in the utility — it stays a pure habitat audit-lifecycle primitive. Implementation lands alongside Phase 2 Slice 2 (Researcher) since the researcher is the first new agent to need it; the summarizer is retrofitted onto the same utility in that same diff (proving the contract serves both call sites) and the ~40-45 lines of cosmetic trim ride along. Source: ADR-006 §2; alternatives (callable-with-work-fn, decorator, BaseAgent class, orchestrator-injected hooks) all rejected with rationale in ADR-006's Alternatives D.
 
 ## Last Session
+ADR-003 — web search tool for the Researcher agent. Chose **Anthropic's built-in
+`web_search` server-side tool**, enabled on the Researcher's single Haiku call
+through `llm.py`. Three alternatives considered at their best and rejected for
+THIS project (not in general): Tavily (LLM-tuned snippets but sits beside
+`llm.py` as a second client; dual source of truth between API response and
+`RawSignals` breaks the fabrication-resistance grounding invariant unless an
+alignment check is added), Brave (cheapest but same structural objection PLUS
+results are raw search-engine descriptions rather than LLM-ready spans —
+requires a second LLM/`web_fetch` round-trip), and custom httpx+BS4 (has no
+search backend; it's a fetch-and-parse layer, not a search-tool decision).
+
+Architectural placement: `llm.complete()` gains a `tools=` passthrough (Slice 2
+scope to design the exact surface); `compute_cost_usd` extends to add
+`num_web_searches * $0.01` onto `LLMResult.cost_usd`; JSONL telemetry gains
+additive `web_searches` / `web_search_fee_usd` keys. The Researcher captures
+`search_result` content blocks from the response verbatim into
+`RawSignals.signals[].text` — the exact prose the model read becomes the corpus
+the drafter's substring check grounds against (ADR-006 §3 contract holds by
+construction, not by reconciliation). Cost lands on `workflow_steps.cost_usd`
+via the existing `run_step()` + `step.record_cost(result.cost_usd)` path; no
+second writer, no new schema. Realistic per-Researcher-run cost: $0.035–$0.045
+(~3 searches × $0.01 fee + Haiku tokens). Tradeoff accepted: vendor lock-in to
+Anthropic's search backend — bounded blast radius because the Researcher is
+encapsulated and its handoff contract is `RawSignals`, not the search tool.
+
+Verified current pricing 2026-05-14: Anthropic `web_search` $10/1K searches +
+token costs; Tavily $0.008/search PAYG (1K/mo free); Brave $5/1K ($5/mo credit,
+legacy free tier deprecated Feb 2026). Numbers stamped in ADR-003 with the same
+"verify before trusting" discipline the existing rate-table Open Question
+applies. Forward dependency handed to Slice 2: extend `llm.py` `tools=`
+passthrough + cost aggregation; build `RawSignals` from `search_result` content
+blocks (not from the model's narrative text); land
+`orchestration/run_step.py` and retrofit the summarizer through it in the same
+diff (ADR-006 §2 forward dependency).
+
+No product code changed. ADR-003 promoted from Proposed to Accepted in
+`docs/adr/README.md`. STATUS.md updated to reflect Phase 2 Slice 2 fully
+unblocked.
+
+## Prior Session
 Slice 7 — multi-URL live calibration + Phase 1 README. Ran the URL summarizer
 against five deliberately varied real URLs (Wikipedia article with `<main>`,
 Python docs with no semantic tags, PEP 20 with `<article>`, sparse example.com,
@@ -222,10 +264,10 @@ Tests: 40 deterministic tests in `tests/test_budget.py` — pure evaluator acros
 
 ## Next Session Entry Point
 **Phase 2 Slice 2 — Researcher agent.** Fresh session, Opus high (slice
-implementation). Before any researcher code: write **ADR-003 (web search tool
-choice)** — Anthropic `web_search` vs Tavily vs Brave vs custom. ADR-003 is
-small (one decision, four options, ~one page) and blocks the researcher's
-external-call shape. After ADR-003 lands, build:
+implementation). ADR-003 is now accepted: the Researcher uses Anthropic's
+server-side `web_search` tool routed through `llm.py`, with the per-search fee
+aggregated into `LLMResult.cost_usd` and `search_result` content blocks
+captured verbatim into `RawSignals`. Build, in order:
 
 1. **`src/agent_habitat/orchestration/run_step.py`** — the context-manager
    utility per ADR-006 §2: `run_step(conn, *, workflow_id, step_index,
@@ -240,15 +282,26 @@ external-call shape. After ADR-003 lands, build:
    constants) noted in the (now-resolved) Open Question. Quality gates must
    stay clean (175+ deterministic tests, ruff, mypy strict).
 3. **`src/agent_habitat/agents/researcher.py`** — `run_researcher(conn,
-   *, company_name, ...)` per ADR-006 §1 handoff contract. Builds
-   `RawSignals` Pydantic v2 model (signal records with text + source URL +
-   retrieved-at). One Haiku LLM call (per the model-routing table) summarising
-   per-signal relevance once the search tool returns. Mirror `{signal_count,
-   source_count}` onto `step.completed`. No LangGraph yet (that's Slice 6 —
-   the orchestrator). The researcher is callable as a standalone agent now;
-   the orchestrator will wrap it later.
+   *, company_name, ...)` per ADR-006 §1 handoff contract and ADR-003's
+   tool decision. Concrete shape:
+   - Extend `llm.complete()` with a `tools=` passthrough (forwarded to
+     `messages.create`); extend `compute_cost_usd` to add `num_web_searches *
+     $0.01` onto `cost_usd`; add `web_searches` + `web_search_fee_usd`
+     additive keys to the JSONL telemetry record. Stamp the per-search rate
+     constant in `llm.py` with a verify-against-public-pricing date.
+   - Build the `RawSignals` Pydantic v2 model: each `Signal` carries
+     `text: str` + `source_url: str` + `retrieved_at: datetime`. Construct
+     signals **directly from `search_result` content blocks** in the response
+     — NOT from the model's narrative text. The block text is what the
+     fabrication-resistance substring check (ADR-006 §3) will ground against.
+   - One Haiku call (per the model-routing table) with
+     `tools=[{"type": "web_search_*", "max_uses": N}]`. Mirror
+     `{signal_count, source_count, web_searches}` onto `step.completed`.
+   - No LangGraph yet (that's Slice 6 — the orchestrator). The researcher is
+     callable as a standalone agent now; the orchestrator will wrap it later.
 
-Phase 2 Slice 1 (this session) is COMPLETE: ADR-006 sets the crew topology,
-the `run_step()` contract, and the fabrication-resistance contract (ADR-005
-folded in). Phase 1 Slice 8 (optional polish) remains available anytime and
-is not on the critical path.
+Phase 2 Slice 1 is COMPLETE (ADR-006 sets the crew topology, the `run_step()`
+contract, and the fabrication-resistance contract — ADR-005 folded in).
+ADR-003 (this session) closes the last blueprint gap before Phase 2 Slice 2.
+Phase 1 Slice 8 (optional polish) remains available anytime and is not on the
+critical path.

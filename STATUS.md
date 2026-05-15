@@ -4,11 +4,83 @@
 Phase 2 — 5-Agent Lead Enrichment Crew (full plan: docs/ROADMAP.md)
 
 ## Current Slice
-Phase 2 Slice 1 — Crew-architecture ADR **— COMPLETE** (ADR-006 accepted 2026-05-14).
-ADR-003 (web search tool) **— ACCEPTED 2026-05-14**. Phase 2 Slice 2 (Researcher
-agent) is now fully unblocked. Phase 1 remains shippable; Slice 8 (optional
-Phase 1 polish) is queued separately and can be picked up anytime without
-blocking Phase 2.
+Phase 2 Slice 2 — Researcher agent + `llm.py` `tools=` passthrough + `RawSignals`
+**— COMPLETE 2026-05-14**. Live smoke passed against `Anthropic`; real
+readable cited spans landed in RawSignals; full habitat round-trip resolved.
+Phase 2 Slice 3 (Extractor agent) is next. ADR-004 (ICP rubric format) must
+land before Slice 4 (Scorer), not Slice 3. Phase 1 remains shippable.
+
+## Phase 2 Slice 2 Subtasks (Researcher + llm.py tools= + RawSignals)
+- [x] `llm.py` extended additively: optional `tools=` param on `complete()` forwarded to `messages.create`; `compute_cost_usd` extended with `web_search_requests=0` kw-only and adds `n * $0.01` server-tool fee onto `cost_usd`; new dated `_WEB_SEARCH_FEE_USD = 0.01` constant ("NEEDS VERIFICATION against current Anthropic pricing"); JSONL telemetry record gains additive `web_searches` / `web_search_fee_usd` keys (only when `tools` is provided — ordinary no-tools calls keep their record shape unchanged); `LLMResult` gains additive `web_searches: int = 0` and `citations: list[Citation] = []`; existing fields untouched, contract still additive
+- [x] `agents/models.py` — new `Signal` (frozen) + `RawSignals` (frozen) Pydantic v2 models with `signal_count` / `source_count` derived properties; empty `signals` list is a valid result (ADR-006 §1 empty-outcome contract)
+- [x] `agents/researcher.py` — `run_researcher(conn, *, company_name, max_searches=3, ...)` makes one Haiku call with `tools=[web_search_20250305]`, builds `Signal` records from `LLMResult.citations[].cited_text`, wires through `run_step()` per ADR-006 §2; projection `{signal_count, source_count, web_searches}` mirrored onto `step.completed`; empty signals → COMPLETED; infrastructure errors propagate from `run_step` and finalise workflow FAILED; no retries (ADR-006 §1, Slice 1)
+- [x] `cli.py` — new `agent-habitat run-researcher COMPANY_NAME [--db PATH] [--workflow-id ID] [--max-searches N]` reusing the `--db` pattern; decision-support footer on the output; FAILED workflow exits non-zero
+- [x] 16 deterministic tests in `tests/test_researcher.py` (RawSignals model + happy run + empty-signals outcome + infrastructure failure + CLI happy/failure); 10 new deterministic tests in `tests/test_llm.py` covering `compute_cost_usd` extension, `_web_search_request_count` defensive defaults, `_extract_web_search_citations`, tools-forwarding, server-tool-fee aggregation, citations onto `LLMResult`, additive JSONL keys, and the no-tools-call-unaffected contract
+- [x] One live smoke against `Anthropic` (well-known public footprint): full habitat round-trip verified — workflow COMPLETED, 4 signals across 3 distinct sources, `cost_total_usd = $0.066871`, `web_searches = 3` (model hit the `max_uses=3` cap), `output_ref` resolves to a real JSONL line with the additive `web_searches` / `web_search_fee_usd` keys, real readable Bloomberg + PYMNTS cited spans
+- [x] Full suite (227 deterministic + 1 researcher live smoke) passes; ruff check + ruff format --check + mypy strict all clean
+
+## Phase 2 Slice 2 Live Smoke Calibration
+
+One live researcher run against `Anthropic` on 2026-05-14 with
+`claude-haiku-4-5-20251001`. Genuine observations a mocked test could not
+have surfaced — the first real audit-grade web_search call through the
+habitat:
+
+- **Real cost: $0.066871** — **~50% higher than ADR-003's $0.035-$0.045
+  estimate.** Driver: input_tokens = 34,971 (not the ~3K ADR-003 assumed
+  for "snippet content"). The web_search tool feeds substantial result
+  content into the model's context window as it reasons across searches;
+  the "~3K snippets" figure understated the inline injection by an order
+  of magnitude. Breakdown: $0.034971 input + $0.0019 output + $0.030 fee
+  (3 searches × $0.01) = $0.066871. The fee component is ~45% of total —
+  significant but not dominant; input tokens are the bigger driver.
+- **THE KNOWN WRINKLE confirmed.** The raw `web_search_tool_result`
+  block's per-result `content[i].encrypted_content` is opaque (Anthropic
+  designed it for multi-turn round-trip, not plain reading). URL, title,
+  and `page_age` are plain readable; the snippet text is not. The
+  plain-readable equivalent — and the corpus this Researcher actually
+  grounds against — is `TextBlock.citations[i].cited_text` from
+  `CitationsWebSearchResultLocation` blocks: verbatim source spans tied
+  to source URL + title that the model chose to cite. **ADR-003's stated
+  premise ("persist the raw search_result block text") cannot be
+  honoured literally; the substantively equivalent grounding shape is
+  citation `cited_text` spans, which is what RawSignals.signals[].text
+  is built from.** Recorded as an Open Question for an ADR-003 addendum.
+- **Citations are real source prose, not narrative.** The four signals
+  surfaced were verbatim Bloomberg + PYMNTS spans ("May 12, 2026 at
+  9:08 PM UTC · Save · Anthropic PBC is in early talks with investors
+  to raise at least $30 billion in fresh financing…"). The model's own
+  narrative TextBlocks are separate and are NOT pulled into Signal
+  records — exactly the fabrication-grounding discipline ADR-006 §3
+  asks for.
+- **The model issued exactly `max_uses=3` searches** — it hit the cap.
+  Suggests the cap is the *real* per-run budget knob; the model tends
+  to spend whatever budget the operator provides. Operator-tunable per
+  call via `--max-searches` and the `run_researcher(max_searches=...)`
+  kwarg.
+- **Signal-to-search ratio is NOT 1:1.** Three searches produced four
+  citations (`signal_count=4, source_count=3`) — multiple citations can
+  come from the same source page; one search can produce zero citations
+  if the model doesn't ground a claim against its results. `signal_count`
+  and `source_count` are distinct projections for a reason.
+- **Wall-time: 5.44s** total (one llm.complete call). Of that, ~5s is
+  Anthropic round-trip (model + server-side searches + reasoning).
+  Phase 2's 5-agent pipeline at this per-agent latency is ~15-25s
+  end-to-end on a single run, before any parallelisation.
+- **Audit chain holds end-to-end on the new tool path.** Workflow row
+  + one step row + four events (`workflow.started` → `step.started` →
+  `step.completed` → `workflow.completed`); step.completed structured
+  data carries `{signal_count: 4, source_count: 3, web_searches: 3,
+  cost_usd, output_ref}`. JSONL telemetry record at the `output_ref`
+  resolves and includes both additive keys `web_searches: 3` and
+  `web_search_fee_usd: 0.03`. First real exercise of `tools=` through
+  `llm.py`; the additive contract worked first try.
+
+**Cost expectations updated.** A typical Researcher run is **~$0.06-$0.07**,
+not the ADR-003 estimate of $0.035-$0.045. Implication for Slice 8
+budget calibration: a 5-agent pipeline run is now expected at
+~$0.10-$0.15 (Researcher dominant; Extractor/Scorer/Critic on cheaper
+tiers + smaller token loads; Drafter on Opus is the other heavy line).
 
 ## Slice 1 Subtasks
 - [x] Scaffold project skeleton + plan docs
@@ -105,6 +177,8 @@ Slice 7 calibration story / README:
 - [x] 30 deterministic tests in `tests/test_checkpoint.py`; full suite (149 tests) passes, ruff check + ruff format + mypy strict clean
 
 ## Open Questions
+- **ADR-003 premise needs an addendum — RawSignals grounds against `citations[].cited_text`, not raw `web_search_result` block content.** ADR-003 (Decision section + Forward dependency) stated: "Search-result content blocks are captured verbatim from the response into `RawSignals.signals[].text` (with the block's source URL into `.source_url`)." Live verification on 2026-05-14 showed the actual `web_search_tool_result.content[i].encrypted_content` is **opaque/encrypted** (Anthropic designs it for multi-turn round-trip; URL + title + page_age are plain but the snippet text is not). The plain-readable equivalent — and what the Researcher now uses — is `CitationsWebSearchResultLocation.cited_text` from the model's TextBlock citations: verbatim source spans tied to source URL + title that the model chose to ground a claim against. The grounding invariant ADR-006 §3 needs (Signal text = real source prose, not model narrative) holds by construction against `cited_text` — these spans are tool-surfaced source content, not the model's own phrasing. Open question for Joseph: write an ADR-003 addendum that (a) acknowledges the encrypted-block discovery, (b) names `citations[].cited_text` as the authoritative grounding corpus, (c) accepts the consequence that signals exist only for spans the model actually cited (a model claim made without a citation produces no signal — likely the right semantics for a fabrication-resistance contract, but worth ratifying explicitly). Source: Phase 2 Slice 2 live smoke calibration above.
+- **ADR-003 cost estimate was low by ~50%.** ADR-003 estimated $0.035-$0.045 per researcher run. Live calibration on 2026-05-14 measured $0.066871 (one run, 3 searches at `max_uses=3`). Driver: ADR-003 assumed ~3K input tokens; the live call ingested 34,971 input tokens because Anthropic's web_search injects substantial result content into the model's context as it reasons across searches. Implication: Slice 8 budget cap calibration must size against ~$0.07/Researcher-run, not ~$0.04. Phase 2 5-agent pipeline cost expectation revises to ~$0.10-$0.15 per company. Not a decision question — a numbers-update for Slice 8.
 - **Consolidate `llm.py`'s JSONL telemetry writer through the ObservabilityLayer.** Today `llm.py._append_telemetry` writes JSONL directly; Slice 4 added the conventioned READ side (`iter_telemetry`, `resolve_output_ref`) but did NOT touch the writer — `LLMResult` is a load-bearing contract and rule #14 forbids broad refactors without an ADR. Future work: either (a) route llm.py's writer through an ObservabilityLayer writer module so the path/line/format conventions live in one place, or (b) explicitly document the writer-stays-in-llm.py boundary as the chosen architecture. Trigger: any second writer of JSONL telemetry (Slice 5 checkpoint payloads? Phase 2 agent intermediate artefacts?) — that's the moment to centralise.
 - **Rate table needs verification.** `_RATES_USD_PER_MTOK` in `llm.py` uses best-known values (Haiku $1/$5, Sonnet $3/$15, Opus $15/$75 per MTok input/output) stamped 2026-05-13. Joseph: cross-check against the public Anthropic pricing page before relying on the cost numbers for any budget decision (Slice 3 enforcement is now wired but reads the same rate table).
 - **ADR-002 underspecification: `workflows.id` generation algorithm.** ADR-002 fixes the *relationship* (id is shared with LangGraph as `thread_id`) and the *type* (TEXT PRIMARY KEY) but does not name a generation method. Slice 2 defaults to `uuid.uuid4().hex` via `new_workflow_id()`; callers may override. Revisit with an ADR-002 addendum if Phase 2 needs sortable or time-prefixed ids (ULID, snowflake) for cheap range scans.
@@ -114,6 +188,84 @@ Slice 7 calibration story / README:
 - **`run_step()` utility — IMPLEMENTED 2026-05-14.** `src/agent_habitat/orchestration/run_step.py` ships the `StepRecorder` dataclass + `run_step()` context manager exactly per ADR-006 §2. Summarizer retrofitted onto it in the same commit; 20 deterministic tests in `tests/test_run_step.py`; all 196 deterministic tests pass; live smoke confirmed. Cosmetic trim (docstring, section dividers, WORKFLOW_TYPE/AGENT_NAME inlined) rode along. summarizer.py: 645 → 391 lines.
 
 ## Last Session
+Phase 2 Slice 2 (remainder) — Researcher agent + `llm.py` `tools=` passthrough +
+`RawSignals` model.
+
+Extended `llm.py` additively: optional `tools=` parameter on `complete()`
+forwarded unchanged to `messages.create`; `compute_cost_usd` extended with
+`web_search_requests=0` kw-only and adds `n × $0.01` server-tool fee onto
+`cost_usd` so `LLMResult.cost_usd` stays the single aggregated cost figure
+the budget primitives and `run_step` consume; dated `_WEB_SEARCH_FEE_USD = 0.01`
+constant ("NEEDS VERIFICATION against current Anthropic pricing"); JSONL
+telemetry record gains additive `web_searches` / `web_search_fee_usd` keys
+**only when** `tools` is provided — ordinary no-tools calls keep their record
+shape exactly as before. `LLMResult` gains additive `web_searches: int = 0`
+and `citations: list[Citation] = []`; existing fields and the contract are
+untouched. New `Citation` Pydantic v2 model (`cited_text`, `source_url`,
+`source_title`) — surfaces `CitationsWebSearchResultLocation` blocks from
+the response in a typed shape.
+
+Built `src/agent_habitat/agents/models.py` with `Signal` (frozen v2 model,
+`text` + `source_url` + `source_title` + `retrieved_at`) and `RawSignals`
+(frozen v2 model, `company_name` + `signals: list[Signal]` plus derived
+`signal_count` and `source_count` properties). The `Signal.text` field is
+sourced from `Citation.cited_text` — verbatim source prose surfaced by
+Anthropic's web_search tool, NEVER the model's own narrative phrasing.
+This is the upstream half of ADR-006 §3's fabrication-resistance grounding
+invariant.
+
+Built `src/agent_habitat/agents/researcher.py`: `run_researcher(conn, *,
+company_name, max_searches=3, ...)` opens a `lead_enrichment_researcher`
+workflow, wraps one `llm.complete()` call (Haiku tier, `tools=[web_search_20250305]`)
+through `run_step()` per ADR-006 §2, builds `Signal` records from
+`LLMResult.citations[].cited_text`, mirrors `{signal_count, source_count,
+web_searches}` onto `step.completed`'s structured_data, and finalises
+`workflow.completed` with the cost rolled up. Empty signals → COMPLETED
+(ADR-006 §1 empty-outcome contract: empty is a valid result, not a
+failure). Infrastructure errors propagate from `run_step` → step FAILED →
+workflow FAILED with `finished_at` stamped → `workflow.failed` event
+emitted; no retries (ADR-006 §1, Slice 1). The Researcher never raises to
+its caller; the caller gets a `ResearcherResult` carrying status, signals,
+cost, and error context.
+
+CLI surface: `agent-habitat run-researcher COMPANY_NAME [--db PATH]
+[--workflow-id ID] [--max-searches N]`. Reuses the `--db` pattern. Prints
+workflow id + status + cost + each surfaced signal (title + URL + first
+~200 chars of cited prose), footer-disclaimed for decision-support framing
+(CLAUDE.md non-obvious constraint). Failed runs exit non-zero.
+
+Tests: 16 deterministic in `tests/test_researcher.py` (RawSignals model
+validation/round-trip; happy run persists workflow + step + events; cost
+rolled up + output_ref set + projection mirrored; empty-signals run
+produces a structured empty-but-typed `RawSignals` and a COMPLETED (not
+FAILED) workflow; LLM error path finalises step FAILED + workflow FAILED
+without escaping the exception; CLI happy + failure + `--max-searches`
+override). 10 new deterministic tests in `tests/test_llm.py` cover the
+`tools=` passthrough surface (server-tool fee aggregation, citation
+extraction, additive JSONL keys, no-tools-call-unaffected contract).
+Full suite: 227 deterministic tests pass; ruff check + ruff format
+--check + mypy strict all clean.
+
+**THE KNOWN WRINKLE landed and was resolved honestly.** ADR-003's stated
+premise — "persist the raw search_result block text" — does not hold
+against the actual API response shape: per-result `encrypted_content` is
+opaque. The honest grounding corpus is `citations[].cited_text` (verbatim
+source spans the model chose to cite), and that is what `RawSignals.text`
+is built from — recorded as an Open Question for an ADR-003 addendum
+(see Open Questions section above).
+
+One live smoke against `Anthropic` ran successfully: 5.44s wall-time,
+$0.066871 cost (3 searches × $0.01 fee + 34,971 input tokens + 380
+output tokens on Haiku), 4 signals across 3 sources, full audit chain
+resolves end-to-end including the additive JSONL telemetry keys. Real
+calibration data captured (see "Phase 2 Slice 2 Live Smoke Calibration"
+section above): cost estimate updated to ~$0.07/run (ADR-003 was low by
+~50%), max_uses cap is the operator's real per-run budget knob, signal
+quality is honestly verbatim Bloomberg + PYMNTS source prose. First
+real exercise of `tools=` through `llm.py`; the additive contract worked
+first try.
+
+## Prior Session
 Phase 2 Slice 2 (partial) — `run_step()` extraction + summarizer retrofit.
 
 Extracted `src/agent_habitat/orchestration/run_step.py` as the shared step
@@ -291,23 +443,35 @@ Slice 3's actual new work (per the kickoff prompt) was the budget-check + halt-s
 Tests: 40 deterministic tests in `tests/test_budget.py` — pure evaluator across boundary/edge cases (zero cap, threshold=0, threshold=1, at-cap, at-threshold); UTC window correctness including tz conversion and naive-datetime defensive path; `cost_within_window` inclusion/exclusion at boundaries and isolation across workflows; end-to-end check with override resolution; exceed-event row shape; halt-signal query including the "unrelated error event must not trip the halt" anti-confusion case; TOML config loading including missing file, malformed TOML, missing required key, missing [defaults] section, override without `daily_cap_usd`, threshold out of range, and a sanity-check that the bundled `config/budgets.toml` loads. Full suite (90 tests including llm.py and state) passes cleanly. ruff check + ruff format + mypy strict all clean.
 
 ## Next Session Entry Point
-**Phase 2 Slice 2 (remainder) — Researcher agent + llm.py tools= passthrough +
-RawSignals model.** Fresh session, Opus high (slice implementation). ADR-003 is
-accepted; `run_step()` is done; the summarizer retrofit is done. Build:
+**Phase 2 Slice 3 — Extractor agent + `CompanyProfile` model.** Fresh
+session, Opus high (slice implementation). ADR-006 §1 names the contract:
+the Extractor consumes `RawSignals`, produces `CompanyProfile` (with the
+ExtractionGap pattern per PATTERNS.md #2 — each structured field carries
+a source-span reference back into `RawSignals`), and mirrors
+`{has_size, has_tech_stack, has_decision_makers, gap_count}` onto
+`step.completed`. Tier: Sonnet (ADR routing table). Build:
 
-1. **Extend `llm.complete()` with a `tools=` passthrough** — forwarded to
-   `messages.create`; extend `compute_cost_usd` to add
-   `num_web_searches * $0.01` onto `cost_usd`; add additive `web_searches` /
-   `web_search_fee_usd` keys to the JSONL telemetry record. Stamp the
-   per-search rate constant with a verify-against-public-pricing date.
-2. **`RawSignals` Pydantic v2 model** — each `Signal` carries `text: str` +
-   `source_url: str` + `retrieved_at: datetime`. Construct signals directly
-   from `search_result` content blocks in the API response, NOT from the
-   model's narrative text (fabrication-resistance grounding invariant per
-   ADR-006 §3).
-3. **`src/agent_habitat/agents/researcher.py`** — `run_researcher(conn, *,
-   company_name, ...)` via `run_step()`, one Haiku call with
-   `tools=[web_search]`, mirror `{signal_count, source_count, web_searches}`
-   onto `step.completed`. Standalone callable; LangGraph wiring is Slice 6.
+1. **`agents/models.py` extension** — add `CompanyProfile` and any
+   `ExtractionGap` / `ProfileField` shape. Each extracted field carries
+   the verbatim source span it was derived from (a substring of some
+   upstream `Signal.text`). The substring constraint is what makes the
+   Slice 7 critic's fabrication check tractable — same discipline as
+   the Researcher's `Signal.text` from `cited_text`.
+2. **`src/agent_habitat/agents/extractor.py`** — `run_extractor(conn,
+   *, raw_signals, ...)` via `run_step()`, one Sonnet call, structured
+   output with field-level source-span tracking. Mirror the projection
+   above onto `step.completed`.
+3. **CLI** — `agent-habitat run-extractor` that consumes a workflow id
+   whose RawSignals was already produced (or runs the Researcher
+   inline as a convenience). Decision-support footer on output.
+4. **Tests** — deterministic with mocked LLM (happy + each gap state)
+   plus one live smoke. Stress-test that extracted spans really
+   substring-match into `RawSignals.signals[].text`.
 
-`run_step()` and the summarizer retrofit are DONE. No re-work needed there.
+ADR-003 addendum (recorded under Open Questions: `cited_text` is the
+real grounding corpus) is a small documentation task — not blocking
+Slice 3. ADR-004 (ICP rubric format) must land BEFORE Slice 4 (Scorer),
+NOT Slice 3.
+
+`run_step()`, `llm.py` `tools=` passthrough, `RawSignals`, and the
+Researcher are DONE. No re-work needed there.

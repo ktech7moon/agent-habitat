@@ -20,7 +20,12 @@ from pathlib import Path
 import click
 
 from agent_habitat import __version__
-from agent_habitat.agents import SummarizerResult, run_summarizer
+from agent_habitat.agents import (
+    ResearcherResult,
+    SummarizerResult,
+    run_researcher,
+    run_summarizer,
+)
 from agent_habitat.checkpoint import (
     Checkpoint,
     CheckpointError,
@@ -48,6 +53,12 @@ SUMMARIZER_DECISION_FOOTER = (
     "Automated summary; the model can omit, mis-emphasise, or misread "
     "content. Treat as decision support, not as a substitute for reading "
     "the source page."
+)
+
+RESEARCHER_DECISION_FOOTER = (
+    "Automated research signals; the model can miss, mis-cite, or "
+    "stale-cite content. Treat as decision support, not as a substitute "
+    "for verifying each source before acting."
 )
 
 
@@ -223,6 +234,94 @@ def cmd_run_summarizer(url: str, db_path: Path, workflow_id: str | None) -> None
     click.echo(_format_summarizer_result(result))
     if result.status is WorkflowStatus.FAILED:
         raise click.exceptions.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
+# Slice 2 (Phase 2): Researcher agent
+# ---------------------------------------------------------------------------
+
+
+@main.command("run-researcher")
+@click.argument("company_name")
+@click.option(
+    "--db",
+    "db_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=DEFAULT_DB_PATH,
+    show_default=True,
+    help="Path to the agent-habitat SQLite file.",
+)
+@click.option(
+    "--workflow-id",
+    default=None,
+    help="Override the generated workflow id (used for tests / reruns).",
+)
+@click.option(
+    "--max-searches",
+    default=3,
+    show_default=True,
+    type=int,
+    help="Cap on web_search requests the model may issue this run.",
+)
+def cmd_run_researcher(
+    company_name: str,
+    db_path: Path,
+    workflow_id: str | None,
+    max_searches: int,
+) -> None:
+    """Run the Researcher agent: one Haiku call with web_search, RawSignals out.
+
+    Exercises the full habitat stack end-to-end: workflow + step + events
+    persisted, telemetry written through llm.py (with the tools= passthrough
+    and server-tool fee folded into cost), citations captured into a
+    RawSignals payload, cost rolled up. The signals are printed to stdout
+    with a decision-support footer.
+    """
+    conn = init_db(db_path)
+    try:
+        result = run_researcher(
+            conn,
+            company_name=company_name,
+            workflow_id=workflow_id,
+            max_searches=max_searches,
+        )
+    finally:
+        conn.close()
+
+    click.echo(_format_researcher_result(result))
+    if result.status is WorkflowStatus.FAILED:
+        raise click.exceptions.Exit(code=1)
+
+
+def _format_researcher_result(result: ResearcherResult) -> str:
+    lines: list[str] = [
+        f"Workflow {result.workflow_id} — status: {result.status.value.upper()}",
+        f"Company  : {result.company_name}",
+        f"Cost USD : {result.cost_usd:.6f}",
+        f"Signals  : {result.raw_signals.signal_count} "
+        f"(across {result.raw_signals.source_count} source(s))",
+        "",
+    ]
+    if result.status is WorkflowStatus.COMPLETED:
+        if result.raw_signals.signals:
+            for i, sig in enumerate(result.raw_signals.signals, start=1):
+                title = sig.source_title or "(untitled)"
+                lines.append(f"  [{i}] {title}")
+                lines.append(f"      {sig.source_url}")
+                # Print first ~200 chars of the cited span; full text is in JSONL.
+                preview = sig.text.strip().replace("\n", " ")
+                if len(preview) > 200:
+                    preview = preview[:200] + "…"
+                lines.append(f'      "{preview}"')
+                lines.append("")
+        else:
+            lines.append("  (no signals surfaced — a valid empty-outcome result)")
+            lines.append("")
+        lines.append(RESEARCHER_DECISION_FOOTER)
+    else:
+        lines.append(f"Failed at step: {result.error_step or '(unknown)'}")
+        lines.append(f"Error: {result.error_message or '(no message)'}")
+    return "\n".join(lines)
 
 
 def _format_summarizer_result(result: SummarizerResult) -> str:

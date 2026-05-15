@@ -39,3 +39,6 @@ python_version = "3.11"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    "live: calls the live Anthropic API (costs money); deselect with -m 'not live'",
+]

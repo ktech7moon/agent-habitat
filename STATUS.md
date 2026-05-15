@@ -4,29 +4,212 @@
 Phase 2 — 5-Agent Lead Enrichment Crew (full plan: docs/ROADMAP.md)
 
 ## Current Slice
-**Pre-orchestrator refactor — DONE 2026-05-14.** Extracted pure Layer A
-node functions from the four built agents (researcher, extractor, scorer,
-summarizer) so Phase 2 Slice 6 (LangGraph orchestrator) can compose them
-cleanly. Behavior-preserving: four existing agent test suites pass UNCHANGED
-(0 test edits); 13 new Layer A tests added; ruff/format/mypy strict all
-clean; one live smoke (summarizer round-trip + Wikipedia truncation) green
-through the refactored standalone path.
+**Phase 2 Slice 5 (Drafter agent) — DONE 2026-05-14.** New
+`src/agent_habitat/agents/drafter.py` (Layer A `drafter_node` + Layer B
+`run_drafter`, sibling functions in one file matching the post-refactor
+pattern); `Draft` + `DraftClaim` Pydantic models added to
+`agents/models.py`; `run-drafter` CLI command added to `cli.py` (sequences
+Researcher → Extractor → Scorer → Drafter as four separate workflows,
+previewing the Slice 6 orchestrator's `terminate_no_draft` routing by
+skipping the Drafter call when the ScoredCompany is gated). 56
+deterministic tests + 1 live smoke. Full suite (426 deterministic, +1
+Drafter live smoke) clean; ruff check + ruff format + mypy strict all
+clean. **Slice 6 (orchestrator) and Slice 7 (critic) are now BOTH
+unblocked** — Slice 6 has all 5 Phase 2 agents available as Layer A pure
+nodes; Slice 7 has the load-bearing Slice 5 calibration finding to build
+its substring check against (see "Phase 2 Slice 5 Live Smoke Calibration"
+below).
 
-Each Phase 2 agent now exposes `<name>_node(...)` returning `<Name>NodeOutput`
-(typed agent output + cost_usd + output_ref + structured_data). The standalone
-`run_<name>(...)` wrapper preserves the workflow-lifecycle envelope
-(`insert_workflow` → `with run_step(...) as step: out = <name>_node(...);
-step.record_*(out.*)` → finalise COMPLETED/FAILED), so the CLI commands
-(`run-researcher`, `run-extractor`, `run-scorer`, `run-summarizer`) keep
-working identically. `cli.py` is untouched. The summarizer (a 3-step
-intra-agent workflow predating the crew) gets the same treatment via a new
-sibling `summarize_text(...)` returning `SummarizerNodeOutput`; its two
-already-pure helpers (`fetch_url`, `extract_readable_text`) stay as-is.
+## Phase 2 Slice 5 Subtasks (Drafter + Draft model + DraftClaim)
+- [x] `agents/models.py` extension — `DraftClaim` (per-claim carrier:
+  `text` + `supporting_dimension`; `supporting_dimension` field-validated
+  to be a member of `PROFILE_FIELD_NAMES`), `Draft` (composite carrier:
+  `company_name`, `prose`, `claims`; model_validator enforces every
+  `claim.text` substring-matches `prose` after whitespace+case
+  normalisation; computed properties `paragraph_count` / `char_count` /
+  `claim_count` for the projection). All `ConfigDict(extra="forbid",
+  frozen=True)`. The model invariants make ADR-006 §3's substring check
+  mechanically possible: enumerable claims, each anchored to a
+  `PROFILE_FIELD_NAMES` member.
+- [x] `agents/drafter.py` — `drafter_node(scored_company=...,
+  workflow_id=..., log_root=...)` returning `DrafterNodeOutput(draft,
+  cost_usd, output_ref, structured_data)`. Layer A is DB-pure: no
+  `sqlite3.Connection`, no `run_step`, no `insert_workflow`. Opus 4.7
+  tier (`ModelTier.OPUS`) via `llm.complete()` — no `llm.py` change.
+  Schema-in-system-prompt + `model_validate_json` per the established
+  Slice 3/4 structured-output choice. `run_drafter(conn, ...)` is the
+  Layer B wrapper — `insert_workflow` → emit `workflow.started` → `with
+  run_step(...) as step: out = drafter_node(...);
+  step.record_cost/output_ref/structured_data` → finalise
+  COMPLETED/FAILED. Same shape as `run_extractor` / `run_scorer`.
+- [x] **Below-floor input handling:** `scored_company.routes_to_draft is
+  False` raises `DrafterCalledBelowFloorError` (subclass of
+  `DrafterError`). Reasoning: orchestrator routing is the orchestrator's
+  job (ADR-006 §1 `terminate_no_draft`). A Drafter being invoked against
+  a gated ScoredCompany is a caller bug, not a normal outcome — explicit
+  raise makes the bug loud. The CLI surface previews the Slice 6
+  routing by checking `routes_to_draft` itself before invoking the
+  Drafter and printing a clearly-labelled "no draft" block.
+- [x] **High-score-low-coverage input handling:** Proceed normally — no
+  in-prose hedging, no special branch. Reasoning: the operator already
+  sees coverage on the ScoredCompany; the CLI surface (decision-support
+  footer) discloses the score+coverage spread per PATTERNS.md #4. The
+  Draft model does NOT embed coverage in the prose itself; that would
+  conflate the prospect-facing artefact with operator audit metadata
+  and risk Opus inventing hedge phrasing that itself becomes an
+  ungrounded claim.
+- [x] **Cross-input invariant check (post-parse, in `drafter_node`):**
+  every `DraftClaim.supporting_dimension` must reference a non-excluded
+  `DimensionScore` on the input ScoredCompany. The model itself can
+  only validate that the field name is in `PROFILE_FIELD_NAMES`; the
+  cross-input check requires the ScoredCompany. Failure raises
+  `DrafterParseError` — same shape as a schema violation.
+- [x] **Input scope decision documented (drafter.py module docstring):**
+  Slice 5 takes ONLY `ScoredCompany` (not `raw_signals + profile +
+  scored_company` as STATUS's "Next Session Entry Point" implied). The
+  ScoredCompany already carries everything the first hop of the
+  fabrication-check needs (per-dimension `grounded_quote` and
+  `reasoning`); this is the simplest shape that makes the critic's
+  substring check mechanically possible. Slice 6 may broaden the
+  Drafter input via the LangGraph CrewState if the prose noticeably
+  suffers without raw_signals/profile — that is an additive change and
+  does not invalidate this Slice 5 contract.
+- [x] **Projection mirrored onto `step.completed`:**
+  `{paragraph_count, char_count, claim_count}` per ADR-006 §1.3 + §4
+  Slice 5 spec. Computed from `Draft.prose` and `Draft.claims` so the
+  projection cannot drift from the actual artefact.
+- [x] `cli.py` — `agent-habitat run-drafter COMPANY_NAME [--db PATH]
+  [--rubric PATH] [--max-searches N] [--*-workflow-id ID]` sequences
+  the four agents as four separate workflows. Decision-support footer
+  surfaces score+coverage per PATTERNS.md #4 ("scored 64.0/100 against
+  the rubric, but the rubric covered only 50% of the operator's stated
+  ICP dimensions on this run"). Gated ScoredCompany skips the Drafter
+  call and prints a clearly-labelled "NO DRAFT — ScoredCompany was
+  gated by 'score'" block (workflow ends successfully, exit 0 — gating
+  is a valid empty-outcome). Upstream failures (researcher/extractor/
+  scorer) exit non-zero with the partial chain shown. Drafter failure
+  exits non-zero with FAILED status surfaced.
+- [x] 56 deterministic tests in `tests/test_drafter.py` —
+  DraftClaim model (6: round-trip, extra=forbid, frozen, empty-text,
+  every PROFILE_FIELD_NAMES value accepted, unknown-dim rejected);
+  Draft model (12: round-trip, extra=forbid, frozen, empty-prose,
+  empty-claims-allowed-structurally, claim-text-not-in-prose rejected,
+  claim-text-in-prose-after-normalisation, claim-text-normalises-to-empty,
+  paragraph_count one and three, char_count, claim_count); pure helpers
+  (10: `_strip_code_fence` 3, `_parse_draft` 6, `_check_claims_against_input`
+  3, `_projection` 1); Layer A `drafter_node` (10: happy path, below-floor
+  raises, below-coverage raises, high-score-low-coverage proceeds,
+  schema mismatch, invalid JSON, claim references excluded dim,
+  claim text not in prose, LLM raises propagates, uses Opus tier with
+  correct kwargs); Layer B `run_drafter` (5: happy round-trip,
+  step.completed projection, LLM raises → FAILED, below-floor → FAILED,
+  parse error → FAILED); CLI (5: happy 4-stage, scorer-gates no-draft
+  block, scorer failure exits non-zero, drafter failure exits non-zero,
+  missing rubric clean error).
+- [x] One live smoke (`@pytest.mark.live`) — see "Phase 2 Slice 5 Live
+  Smoke Calibration" below.
+- [x] **The four existing agent test files were NOT touched.** The 370
+  pre-Slice-5 deterministic tests pass unchanged. Test patch targets
+  (`patch.object(<agent>_mod, "complete", ...)`), test imports, and CLI
+  formatters are all preserved. `llm.py`, `run_step.py`, ADR-002's
+  schema, the existing agent models, and the four existing agents'
+  code are all unchanged. Full suite (426 deterministic) clean; ruff
+  check + ruff format + mypy strict all clean.
 
-Slice 6 (orchestrator) now inherits four Layer A pure node functions it
-can wrap as LangGraph nodes — the wrap is `with run_step(conn, ...) as
-step: out = <name>_node(state...); step.record_cost(out.cost_usd); ...;
-return {"<key>": out.<typed_output>}`. `run_step.py` is unchanged.
+## Phase 2 Slice 5 Live Smoke Calibration
+
+One live four-agent run against `Anthropic` on 2026-05-14
+(researcher: `claude-haiku-4-5-20251001` + web_search; extractor +
+scorer: `claude-sonnet-4-6`; drafter: `claude-opus-4-7`). The first
+real end-to-end audit-grade outreach draft through the full
+Researcher → Extractor → Scorer → Drafter chain:
+
+- **Drafter cost: $0.053910** for one Opus 4.7 call producing a
+  3-paragraph 626-char draft with 2 enumerated claims. Within
+  ADR-006 §1's $0.025–$0.060 estimate; consistent with the
+  ~1500 input-token + ~400 output-token per-Drafter-call shape.
+  **Four-agent chain combined: $0.135073** (Researcher $0.065149 +
+  Extractor $0.008664 + Scorer $0.007350 + Drafter $0.053910). The
+  Drafter alone is ~40% of the chain cost — Opus pricing dominates
+  even with the rest of the chain on the cheaper tiers, exactly as
+  ADR-006 §1's checkpoint-cost-rationale anticipated.
+- **Wall-time: 10s for the Drafter**, ~26s for the full four-agent
+  chain. Consistent with Slice 2's "~15-25s end-to-end for 5 agents"
+  projection (no critic yet; Slice 7 adds one Haiku call worth ~$0.001
+  and ~3-4s).
+- **Used a relaxed rubric for the live smoke** (floor=0.0, tier_c_min=
+  0.0) so the Drafter actually runs against a real ScoredCompany. The
+  bundled rubric had Anthropic at score=20 / coverage=20% on a prior
+  attempt — gated. The point of the smoke is to observe Opus's
+  first-contact prose, not to validate the bundled rubric.
+- **THE LOAD-BEARING FINDING — OPUS PARAPHRASED BOTH GROUNDED QUOTES.
+  THE CRITIC IN SLICE 7 WILL NEED TO CATCH THIS.** The Slice-5 Drafter
+  shapes its output for the substring check (claims enumerated,
+  anchored to dimensions); the Slice-7 critic does the substring
+  check itself. Exactly as the kickoff predicted ("Opus is more
+  capable but the prose temptation is higher"), Opus paraphrased
+  both grounded_quotes when verbatim copy was the honest move:
+
+  | Claim | Cited dim's grounded_quote | Failure |
+  |---|---|---|
+  | "Anthropic is in early talks with investors to raise at least $30 billion in fresh financing" | "Anthropic PBC is in early talks with investors to raise at least $30 billion in fresh financing" | dropped "PBC" — claim is no longer a substring |
+  | "partnership with the Gates Foundation on a $200 million health-and-education-focused AI initiative" | "Anthropic teamed with the Gates Foundation on a $200 million health-and-education-focused artifici[al]…" | "teamed with" → "partnership with" — paraphrase, not substring |
+
+  Both are *factually faithful* paraphrases — but the substring
+  check rejects them. This is exactly the case ADR-006 §3's
+  "calibrated middle" (substring after whitespace+case normalisation)
+  is meant to catch: "tight enough to catch hallucinations, loose
+  enough to permit faithful rephrasing" — but THIS rephrasing is
+  beyond the loosened tolerance. The Slice 7 critic's red-team
+  smoke should explicitly verify the substring check rejects these
+  two specific patterns: dropped corporate suffix ("PBC") and
+  synonym substitution ("teamed with" → "partnership with"). The
+  Slice 5 calibration evidence: the substring check IS load-bearing
+  — without it, faithful paraphrases would pass and the
+  fabrication-resistance contract would degrade to "trust the LLM
+  judge". With it, the Drafter's first-contact behaviour reveals
+  the gap the contract exists to enforce.
+- **The Drafter's claim ENUMERATION worked correctly.** Both claims
+  pointed at non-excluded dimensions on the input ScoredCompany
+  (`recent_news`, `industry`); the Drafter's cross-input invariant
+  check passed (no excluded-dimension citations). The structural
+  decomposition the Drafter is responsible for HELD; the substring
+  hop (Slice 7's critic job) is what failed. The split between
+  Drafter-shapes-output and Critic-verifies-output is exactly the
+  right architectural seam — Slice 5 producing 2/2 over-reaches
+  validates that the critic is necessary, not optional.
+- **The decision-support footer fired correctly.** The CLI surface
+  printed "Scored 64.00/100 against the rubric, but the rubric
+  covered 50% of the operator's stated ICP dimensions on this run."
+  PATTERNS.md #4's coverage-aware disclosure shape carries one hop
+  forward into the user-visible Drafter surface as planned.
+
+**Implication for Slice 7 (Critic).** The substring check that ADR-006
+§3 describes is unambiguously necessary. The Slice 5 Drafter ON ITS OWN
+will not produce drafts that pass the check; the bounded retry edge
+(ADR-006 §1 — first violation routes back to drafter with critic
+feedback appended) is what the chain depends on. Slice 7's calibration
+should record what the second-pass behaviour looks like with the
+critic's violation report fed back: does Opus then copy the grounded
+quote verbatim, or does it produce a different over-reach? That
+calibration informs whether the bounded-retry policy is sufficient
+or needs to be extended.
+
+**Implication for the Drafter prompt (deferred to Slice 8).** The
+prompt's CLAIMS RULE is explicit ("`claims[i].text` MUST be a VERBATIM
+SUBSTRING of `prose`. Whitespace and case are normalised by a
+downstream check, but the substring itself must appear in the prose.
+If you write 'raised a $50M Series B' in the prose, the claim text
+must be 'raised a $50M Series B' (or a contiguous substring of that),
+not a paraphrase."). This rule is followed (claim.text IS in prose).
+The over-reach is one hop further: the prose paraphrases the
+grounded_quote, and the claim faithfully extracts the paraphrased
+prose span — so claim.text appears in prose AND fails to substring-
+match the dim's grounded_quote. The prompt could add a second rule
+("the prose itself must use verbatim phrasing from the dimension
+grounded_quotes when making concrete claims") but Slice 8 is the
+place to tune this; tuning prompts mid-implementation is exactly
+what the Slice scope boundary forbids.
 
 ## Phase 2 Slice 4 (Scorer agent) — DONE 2026-05-14
 Three new
@@ -452,6 +635,90 @@ Slice 7 calibration story / README:
 - **`run_step()` utility — IMPLEMENTED 2026-05-14.** `src/agent_habitat/orchestration/run_step.py` ships the `StepRecorder` dataclass + `run_step()` context manager exactly per ADR-006 §2. Summarizer retrofitted onto it in the same commit; 20 deterministic tests in `tests/test_run_step.py`; all 196 deterministic tests pass; live smoke confirmed. Cosmetic trim (docstring, section dividers, WORKFLOW_TYPE/AGENT_NAME inlined) rode along. summarizer.py: 645 → 391 lines.
 
 ## Last Session
+**Phase 2 Slice 5 — Drafter agent + Draft / DraftClaim models.**
+Opus 4.7 high, building one new agent against the post-refactor Layer A
+/ Layer B template (Layer A `drafter_node` is DB-pure; Layer B
+`run_drafter` owns the workflow lifecycle + `run_step` envelope). Two
+new files (`src/agent_habitat/agents/drafter.py`,
+`tests/test_drafter.py`); two extensions (`agents/models.py` adds
+`Draft` + `DraftClaim`; `agents/__init__.py` adds the export surface;
+`cli.py` adds the `run-drafter` four-stage command + decision-support
+footer). Zero edits to the four existing agent files. The Drafter is
+the first Opus 4.7 agent in the chain — ADR-001's reserved tier — and
+its first contact reproduced exactly the over-reach pattern the kickoff
+predicted: faithful paraphrase that fails the substring check (see
+"Phase 2 Slice 5 Live Smoke Calibration" above).
+
+**Design choice — input scope.** The Drafter's signature takes ONLY
+`ScoredCompany`, not the broader `(raw_signals, profile,
+scored_company)` tuple STATUS's "Next Session Entry Point" implied.
+Rationale: ScoredCompany already carries everything the first hop of
+the substring chain needs (per-dimension `grounded_quote` and
+`reasoning`); this is the simplest shape that makes the critic's check
+mechanically possible. Slice 6 (orchestrator) may broaden the input
+via the LangGraph CrewState if the prose noticeably suffers without
+the upstream prose corpora — that is an additive change and does not
+invalidate this contract.
+
+**Design choice — Draft model invariants.** Two structural invariants
+on the Pydantic model: (a) every `claim.text` is a substring of `prose`
+after whitespace+case normalisation; (b) `supporting_dimension` is a
+member of `PROFILE_FIELD_NAMES`. The cross-input check ("the dimension
+is non-excluded on the actual input ScoredCompany") cannot live on the
+model — the model has no handle on the input — so it lives in
+`drafter_node` as a post-parse step that raises `DrafterParseError`.
+The Drafter does NOT verify the claim→grounded_quote substring chain
+itself; that is the Slice 7 critic's job. The Drafter's job is to
+SHAPE its output (enumerable claims, each anchored to a dimension) so
+the check is mechanically possible.
+
+**Design choice — below-floor handling.** `routes_to_draft is False`
+raises `DrafterCalledBelowFloorError` (subclass of `DrafterError`).
+Routing is the orchestrator's job (ADR-006 §1 `terminate_no_draft`); a
+Drafter being invoked against a gated ScoredCompany is a caller bug,
+not a normal outcome. The CLI surface previews the Slice 6 routing by
+checking `routes_to_draft` itself BEFORE invoking the Drafter and
+printing a clearly-labelled "NO DRAFT — gated by 'score'" block
+(workflow ends successfully, exit 0 — gating is a valid empty-outcome).
+
+**Design choice — high-score-low-coverage handling.** Proceed normally;
+no in-prose hedging. The operator sees coverage on the ScoredCompany;
+the CLI surface (decision-support footer) discloses the coverage per
+PATTERNS.md #4. Embedding coverage in the prose itself would conflate
+the prospect-facing artefact with operator audit metadata and risk
+Opus inventing hedge phrasing that itself becomes an ungrounded claim.
+
+**The live smoke produced the load-bearing finding.** Anthropic-on-
+Anthropic, four agents, $0.135 total ($0.054 of which was the
+Drafter's Opus call), 26s wall time, 2 enumerated claims — and BOTH
+claims faithfully paraphrased their cited grounded_quote. Substring
+check rejects both: claim "Anthropic is in early talks…" dropped
+"PBC" (corporate suffix); claim "partnership with the Gates
+Foundation…" substituted "partnership" for "teamed with" (synonym).
+Both are factually faithful; neither is verbatim. The Slice 7 critic's
+red-team smoke must explicitly cover both patterns. Detail: see
+"Phase 2 Slice 5 Live Smoke Calibration" above.
+
+**Correctness oracle: the four existing test files were not edited.**
+The 370 existing deterministic tests pass unchanged. `llm.py`,
+`run_step.py`, ADR-002's schema, the existing agent models, and the
+four existing agents' code are all unchanged. Full suite (426
+deterministic + 1 Drafter live smoke) clean; ruff check + ruff format
++ mypy strict all clean.
+
+File outputs: `src/agent_habitat/agents/drafter.py` (NEW — Layer A
+`drafter_node` + Layer B `run_drafter`, sibling functions in one file
+matching scorer.py's shape), `src/agent_habitat/agents/models.py`
+(`Draft` + `DraftClaim` added; existing models untouched),
+`src/agent_habitat/agents/__init__.py` (export surface for
+`run_drafter`, `Draft`, `DraftClaim`, `DrafterError`,
+`DrafterParseError`, `DrafterCalledBelowFloorError`, `DrafterResult`),
+`src/agent_habitat/cli.py` (the `run-drafter` four-stage command +
+`_format_drafter_result` + `_format_no_draft` + `DRAFTER_DECISION_FOOTER`),
+`tests/test_drafter.py` (NEW — 56 deterministic + 1 live smoke).
+STATUS.md updated.
+
+## Prior Session
 **Pre-orchestrator refactor — Layer A / Layer B split across the four
 built agents.** Opus 4.7 high, behavior-preserving refactor (working,
 tested code; bar = provably unchanged behavior, not "it works"). Four
@@ -1065,6 +1332,61 @@ Slice 3's actual new work (per the kickoff prompt) was the budget-check + halt-s
 Tests: 40 deterministic tests in `tests/test_budget.py` — pure evaluator across boundary/edge cases (zero cap, threshold=0, threshold=1, at-cap, at-threshold); UTC window correctness including tz conversion and naive-datetime defensive path; `cost_within_window` inclusion/exclusion at boundaries and isolation across workflows; end-to-end check with override resolution; exceed-event row shape; halt-signal query including the "unrelated error event must not trip the halt" anti-confusion case; TOML config loading including missing file, malformed TOML, missing required key, missing [defaults] section, override without `daily_cap_usd`, threshold out of range, and a sanity-check that the bundled `config/budgets.toml` loads. Full suite (90 tests including llm.py and state) passes cleanly. ruff check + ruff format + mypy strict all clean.
 
 ## Next Session Entry Point
+**Phase 2 Slice 6 — LangGraph orchestrator.** All five Phase 2 agents
+now exist as Layer A pure node functions (researcher / extractor /
+scorer / drafter; the summarizer is a Phase 1 demo, not a crew node).
+Slice 6 wires them into the LangGraph `StateGraph(CrewState)` per
+ADR-006 §1, installs `langgraph-checkpoint-sqlite` for cross-session
+checkpoint resume, and implements the `request_drafter_approval` node
+that bridges LangGraph's `interrupt()` to the existing CheckpointSystem.
+The Slice 5 Drafter is wired in directly — its `drafter_node` Layer A
+is the LangGraph node body, with `run_step` providing the audit
+envelope. Conditional edges land for the empty-outcome paths
+(`terminate_no_draft` for gated ScoredCompany, `halt` for
+infrastructure failure).
+
+**Slice 7 — Critic — also unblocked AND has a load-bearing calibration
+input ready.** The Slice 5 live smoke produced the first concrete
+fabrication evidence (Anthropic over-reaches, see "Phase 2 Slice 5
+Live Smoke Calibration"). Slice 7 builds `agents/critic.py` (Haiku)
++ `agents/fabrication.py` (pure-Python substring check) per ADR-006 §3,
+and the red-team smoke must explicitly verify the substring check
+rejects: (a) dropped corporate suffix ("Anthropic PBC" →
+"Anthropic"), (b) synonym substitution ("teamed with" →
+"partnership with"). Both are real Opus 4.7 over-reaches captured on
+the Slice 5 first-contact smoke; both pass the "factually faithful"
+human eye test; both fail the substring check. The Slice 5 evidence
+shows the Critic is necessary, not optional.
+
+**Recommendation — Slice 6 first, then Slice 7.** Reasons: (a) Slice 6
+is the integration moment that proves the Layer A / Layer B split was
+correct (the four existing agents wrap unchanged into LangGraph nodes;
+the new Drafter does too); (b) Slice 7's critic depends on the
+LangGraph state shape having all upstream agent outputs reachable from
+the critic node — Slice 6 commits that shape; (c) building the critic
+into a half-built orchestrator would force a second integration pass
+later. But the ordering is reversible — the Critic can land standalone
+against synthetic ScoredCompany / Draft fixtures (the Slice 5 over-
+reach evidence is replayable from the recorded JSONL).
+
+**Two forward dependencies remain queued for Slice 8** (Open Questions):
+`budgets.toml` re-validation against real end-to-end cost (now with
+Slice 5's $0.135/4-agent number as the strongest input — full chain
+with Slice 6 + Slice 7 should land around $0.14-$0.16), and ADR-006
+§1's checkpoint-rationale prose re-check (upstream-chain cost figure
+is ~5× understated). Neither blocks Slice 6 or Slice 7.
+
+**Implication of the Slice 5 live calibration on the Drafter prompt:**
+the prompt could be tightened to instruct Opus to use VERBATIM phrasing
+from `grounded_quote` when constructing concrete claims (rather than
+faithful paraphrase). This would reduce the critic's caught-violation
+rate at the cost of more wooden prose. Per the kickoff scope boundary
+("Do NOT tune the prompt against many real companies — one live smoke
+against one company is enough for this slice. Slice 8 is calibration."),
+the prompt is left as-shipped for Slice 5; Slice 7 + Slice 8
+calibration evidence informs the tuning decision.
+
+## Prior Next Session Entry Point (superseded by Slice 5)
 **Two unblocked candidates — Joseph picks the sequencing.** The pre-
 orchestrator refactor (this session) leaves both ready:
 

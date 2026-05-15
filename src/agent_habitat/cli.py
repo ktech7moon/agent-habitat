@@ -21,10 +21,12 @@ import click
 
 from agent_habitat import __version__
 from agent_habitat.agents import (
+    DrafterResult,
     ExtractorResult,
     ResearcherResult,
     ScorerResult,
     SummarizerResult,
+    run_drafter,
     run_extractor,
     run_researcher,
     run_scorer,
@@ -79,6 +81,22 @@ SCORER_DECISION_FOOTER = (
     "scorable dimensions only; coverage tells you how much of the rubric "
     "this run actually covered. Treat as decision support, not as a "
     "ranking."
+)
+
+#: Decision-support footer printed below the Drafter's prose. Per
+#: PATTERNS.md #4 the disclosure surfaces both the score and the coverage
+#: number so the operator sees what the rubric actually judged on this run
+#: ("82.86/100 against the rubric, but the rubric covered only 70% of the
+#: operator's stated ICP dimensions"). The Draft itself does NOT embed the
+#: coverage in the prose — the operator-internal context lives on the CLI
+#: surface, not in the prospect-facing text.
+DRAFTER_DECISION_FOOTER = (
+    "Automated draft from an Opus 4.7 LLM. The model can fabricate, "
+    "over-claim, or mis-attribute; the enumerated claims trace to the "
+    "scoring chain but the substring-grounding check is a downstream "
+    "agent's job (Slice 7 critic). Verify every concrete claim against "
+    "the cited dimension before sending. Treat as decision support, "
+    "not as a sendable artefact."
 )
 
 
@@ -510,6 +528,229 @@ def cmd_run_scorer(
     click.echo(_format_scorer_result(scorer_result))
     if scorer_result.status is WorkflowStatus.FAILED:
         raise click.exceptions.Exit(code=1)
+
+
+# ---------------------------------------------------------------------------
+# Slice 5 (Phase 2): Drafter agent
+# ---------------------------------------------------------------------------
+
+
+@main.command("run-drafter")
+@click.argument("company_name")
+@click.option(
+    "--db",
+    "db_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=DEFAULT_DB_PATH,
+    show_default=True,
+    help="Path to the agent-habitat SQLite file.",
+)
+@click.option(
+    "--rubric",
+    "rubric_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=DEFAULT_RUBRIC_PATH,
+    show_default=True,
+    help="Path to the ICP rubric TOML file (operator-tunable).",
+)
+@click.option(
+    "--max-searches",
+    default=3,
+    show_default=True,
+    type=int,
+    help="Researcher's web_search cap (forwarded to run-researcher).",
+)
+@click.option(
+    "--researcher-workflow-id",
+    default=None,
+    help="Override the Researcher workflow id (used for tests / reruns).",
+)
+@click.option(
+    "--extractor-workflow-id",
+    default=None,
+    help="Override the Extractor workflow id (used for tests / reruns).",
+)
+@click.option(
+    "--scorer-workflow-id",
+    default=None,
+    help="Override the Scorer workflow id (used for tests / reruns).",
+)
+@click.option(
+    "--drafter-workflow-id",
+    default=None,
+    help="Override the Drafter workflow id (used for tests / reruns).",
+)
+def cmd_run_drafter(
+    company_name: str,
+    db_path: Path,
+    rubric_path: Path,
+    max_searches: int,
+    researcher_workflow_id: str | None,
+    extractor_workflow_id: str | None,
+    scorer_workflow_id: str | None,
+    drafter_workflow_id: str | None,
+) -> None:
+    """Run the Drafter agent: produces a Draft from a passing ScoredCompany.
+
+    Slice 5 has no orchestrator yet, so this CLI sequences four separate
+    workflows: Researcher (Haiku + web_search → RawSignals), Extractor
+    (Sonnet → CompanyProfile), Scorer (Sonnet → ScoredCompany), then
+    Drafter (Opus 4.7 → Draft). If any upstream agent fails, downstream
+    agents are not invoked.
+
+    A ScoredCompany that does not pass both gates (`gated_by is not None`)
+    skips the Drafter call and prints a clearly-labelled "no draft"
+    outcome with the scorer result still shown. This previews the
+    Slice 6 orchestrator's `terminate_no_draft` routing without building
+    it; the workflow is COMPLETED, not FAILED — an ICP miss is a valid
+    empty-outcome, not an error.
+    """
+    try:
+        rubric = load_rubric(rubric_path)
+    except RubricConfigError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    conn = init_db(db_path)
+    drafter_result: DrafterResult | None = None
+    try:
+        researcher_result = run_researcher(
+            conn,
+            company_name=company_name,
+            workflow_id=researcher_workflow_id,
+            max_searches=max_searches,
+        )
+        if researcher_result.status is WorkflowStatus.FAILED:
+            click.echo(_format_researcher_result(researcher_result))
+            raise click.exceptions.Exit(code=1)
+
+        extractor_result = run_extractor(
+            conn,
+            raw_signals=researcher_result.raw_signals,
+            workflow_id=extractor_workflow_id,
+        )
+        if extractor_result.status is WorkflowStatus.FAILED:
+            click.echo(_format_researcher_result(researcher_result))
+            click.echo("")
+            click.echo("=" * 60)
+            click.echo("")
+            click.echo(_format_extractor_result(extractor_result))
+            raise click.exceptions.Exit(code=1)
+
+        scorer_result = run_scorer(
+            conn,
+            profile=extractor_result.profile,
+            rubric=rubric,
+            workflow_id=scorer_workflow_id,
+        )
+        if scorer_result.status is WorkflowStatus.FAILED:
+            click.echo(_format_researcher_result(researcher_result))
+            click.echo("")
+            click.echo("=" * 60)
+            click.echo("")
+            click.echo(_format_extractor_result(extractor_result))
+            click.echo("")
+            click.echo("=" * 60)
+            click.echo("")
+            click.echo(_format_scorer_result(scorer_result))
+            raise click.exceptions.Exit(code=1)
+
+        if scorer_result.scored_company.routes_to_draft:
+            drafter_result = run_drafter(
+                conn,
+                scored_company=scorer_result.scored_company,
+                workflow_id=drafter_workflow_id,
+            )
+    finally:
+        conn.close()
+
+    click.echo(_format_researcher_result(researcher_result))
+    click.echo("")
+    click.echo("=" * 60)
+    click.echo("")
+    click.echo(_format_extractor_result(extractor_result))
+    click.echo("")
+    click.echo("=" * 60)
+    click.echo("")
+    click.echo(_format_scorer_result(scorer_result))
+    click.echo("")
+    click.echo("=" * 60)
+    click.echo("")
+    if drafter_result is None:
+        click.echo(_format_no_draft(scorer_result))
+    else:
+        click.echo(_format_drafter_result(drafter_result, scorer_result))
+        if drafter_result.status is WorkflowStatus.FAILED:
+            raise click.exceptions.Exit(code=1)
+
+
+def _format_no_draft(scorer_result: ScorerResult) -> str:
+    """Render the Slice-5 stand-in for terminate_no_draft routing.
+
+    The orchestrator (Slice 6) will route gated ScoredCompany values to a
+    `terminate_no_draft` node and the workflow will COMPLETE — not FAIL.
+    Until then, the CLI surfaces the same outcome by skipping the Drafter
+    call and printing this clearly-labelled block. The scorer's gating
+    fact is the load-bearing audit row; this block just makes it
+    operator-visible.
+    """
+    sc = scorer_result.scored_company
+    score_str = f"{sc.score:.2f}" if sc.score is not None else "None"
+    coverage_pct = sc.coverage * 100.0
+    return "\n".join(
+        [
+            f"NO DRAFT — ScoredCompany was gated by {sc.gated_by!r}.",
+            f"  score    : {score_str}   (floor {sc.floor:.1f})",
+            f"  coverage : {coverage_pct:.1f}%   (min_coverage {sc.min_coverage:.1%})",
+            "",
+            "The Slice 6 orchestrator will route gated ScoredCompany values to",
+            "a terminate_no_draft node — workflow COMPLETED, no Drafter cost. ",
+            "This CLI surface previews that behaviour by skipping the call.",
+        ]
+    )
+
+
+def _format_drafter_result(result: DrafterResult, scorer_result: ScorerResult) -> str:
+    """Render the Drafter result with the coverage-aware decision-support footer.
+
+    Per PATTERNS.md #4, the disclosure surfaces the score AND the coverage
+    number — operator-facing prose comes from the Drafter, but the
+    operator-internal context (what fraction of the rubric this score
+    actually covered) lives on this CLI surface. The Draft model does NOT
+    embed coverage in the prose itself; that would conflate the prospect-
+    facing artefact with operator audit metadata.
+    """
+    sc = scorer_result.scored_company
+    score_str = f"{sc.score:.2f}" if sc.score is not None else "None"
+    coverage_pct = sc.coverage * 100.0
+    lines: list[str] = [
+        f"Workflow {result.workflow_id} — status: {result.status.value.upper()}",
+        f"Company  : {result.company_name}",
+        f"Cost USD : {result.cost_usd:.6f}   (this Drafter run only)",
+        "",
+    ]
+    if result.status is WorkflowStatus.COMPLETED and result.draft is not None:
+        lines.append("Draft prose:")
+        lines.append(result.draft.prose)
+        lines.append("")
+        lines.append(
+            f"Enumerated claims ({result.draft.claim_count}, anchored to ScoredCompany dimensions):"
+        )
+        for i, claim in enumerate(result.draft.claims, start=1):
+            preview = claim.text.strip().replace("\n", " ")
+            if len(preview) > 160:
+                preview = preview[:160] + "…"
+            lines.append(f'  [{i}] dim={claim.supporting_dimension}: "{preview}"')
+        lines.append("")
+        lines.append(
+            f"Scored {score_str}/100 against the rubric, but the rubric covered "
+            f"{coverage_pct:.0f}% of the operator's stated ICP dimensions on this run."
+        )
+        lines.append("")
+        lines.append(DRAFTER_DECISION_FOOTER)
+    else:
+        lines.append(f"Failed at step: {result.error_step or '(unknown)'}")
+        lines.append(f"Error: {result.error_message or '(no message)'}")
+    return "\n".join(lines)
 
 
 def _format_scorer_result(result: ScorerResult) -> str:

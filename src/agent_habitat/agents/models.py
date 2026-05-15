@@ -468,3 +468,165 @@ class ScoredCompany(BaseModel):
     def routes_to_draft(self) -> bool:
         """True iff this workflow should advance to the drafter (both gates passed)."""
         return self.gated_by is None
+
+
+# ---------------------------------------------------------------------------
+# Drafter output — DraftClaim + Draft. Slice 5 (Phase 2).
+# Per ADR-006 §3 the drafter is the user-visible end of the fabrication-
+# resistance chain. It is allowed to compose prose freely from the
+# upstream agents' grounded text, but the prose MUST be decomposable into
+# enumerable claims, each of which carries a reference to the upstream
+# evidence it draws from. The Slice 7 critic does the substring check;
+# the Drafter only SHAPES its output so the check is mechanically possible.
+#
+# The Slice 5 Drafter scopes its input to the ScoredCompany (the immediate
+# upstream's typed handoff). That carries everything the critic's first hop
+# needs: per-dimension `grounded_quote` (already a substring of the cited
+# `ProfileField.source_spans`, by Scorer construction) and per-dimension
+# reasoning. Each `DraftClaim` therefore points at a `PROFILE_FIELD_NAMES`
+# member that the Drafter's input ScoredCompany has as a non-excluded
+# dimension; the critic walks the chain (DimensionScore.grounded_quote →
+# ProfileField.source_spans → Signal.text → Citation.cited_text) from that
+# anchor. Phase 2 Slice 6 (orchestrator) will broaden the input set if the
+# CrewState shape ends up handing the Drafter raw_signals + profile too;
+# that is an additive change and does not invalidate this Slice 5 contract.
+# ---------------------------------------------------------------------------
+
+
+class DraftClaim(BaseModel):
+    """One enumerable factual claim made in the Draft's prose.
+
+    `text` is a verbatim span lifted from the Draft's `prose` (after
+    whitespace+case normalisation it must appear as a substring there;
+    enforced by the Draft model_validator). The Drafter does NOT do the
+    fabrication substring-check itself — that is the Slice 7 critic's
+    job — but it must produce its output in this enumerable shape so the
+    check is mechanically possible: one Claim per concrete factual span,
+    each anchored to one upstream dimension.
+
+    `supporting_dimension` MUST be a member of `PROFILE_FIELD_NAMES` and,
+    when this DraftClaim is part of a Draft produced by `drafter_node`,
+    MUST point at a non-excluded `DimensionScore` on the input
+    `ScoredCompany`. The structural validation lives here on the model;
+    the cross-input check (non-excluded on the actual ScoredCompany)
+    lives in `drafter_node` as a post-parse step — the model itself does
+    not have access to the input ScoredCompany.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    text: str = Field(
+        ...,
+        min_length=1,
+        description="Verbatim span from the Draft's prose (substring after normalisation).",
+    )
+    supporting_dimension: str = Field(
+        ...,
+        description=(
+            "PROFILE_FIELD_NAMES member naming the ScoredCompany dimension this claim "
+            "draws on. Must reference a non-excluded dimension on the input ScoredCompany "
+            "(post-parse validation in drafter_node)."
+        ),
+    )
+
+    @field_validator("supporting_dimension")
+    @classmethod
+    def _supporting_dimension_in_profile_names(cls, value: str) -> str:
+        if value not in PROFILE_FIELD_NAMES:
+            raise ValueError(
+                f"supporting_dimension must be one of {PROFILE_FIELD_NAMES}; got {value!r}"
+            )
+        return value
+
+
+class Draft(BaseModel):
+    """Drafter's handoff payload — operator-facing prose + enumerable claims.
+
+    `prose` is the user-visible artefact: a short outreach message, drafted
+    by Opus 4.7 against the ScoredCompany's per-dimension reasoning + grounded
+    quotes. It is the only field operators read directly; everything else on
+    this model is audit/critic scaffolding.
+
+    `claims` is the structural decomposition that makes ADR-006 §3's
+    fabrication-resistance check mechanically possible — one DraftClaim per
+    concrete factual span, each anchored to one upstream `ScoredCompany`
+    dimension. The Drafter does NOT verify the chain itself; the Slice 7
+    critic does. But the critic has nothing to check if the prose is
+    delivered as a freeform blob — hence this enumeration is mandatory
+    (an empty `claims` list is structurally permitted but semantically a
+    pure-marketing-prose result the critic would have nothing to ground).
+
+    Two model-level invariants:
+
+    - **Each `claim.text` must appear in `prose`** after whitespace+case
+      normalisation. A claim that does not appear in the prose cannot be
+      a real anchor for the critic's substring check; the model validator
+      enforces this so a malformed LLM response is rejected at parse time
+      rather than silently passed downstream.
+    - **`supporting_dimension` must be a `PROFILE_FIELD_NAMES` member**
+      (per-DraftClaim validator). The cross-input check that the
+      dimension is non-excluded on the actual `ScoredCompany` lives in
+      `drafter_node` (post-parse) — it requires data the model does not
+      see.
+
+    `paragraph_count` and `char_count` are computed properties; they form
+    the `step.completed.structured_data` projection per ADR-006 §1.3 +
+    Slice 5 spec, computed from `prose` so they cannot drift.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    company_name: str = Field(..., description="The company the draft is for.")
+    prose: str = Field(
+        ...,
+        min_length=1,
+        description="The user-visible outreach message — the only field operators read directly.",
+    )
+    claims: list[DraftClaim] = Field(
+        default_factory=list,
+        description=(
+            "Enumerable factual claims, each anchored to one upstream ScoredCompany "
+            "dimension. The Slice 7 critic walks each claim's substring chain back to "
+            "Citation.cited_text. Empty list is structurally valid (pure marketing prose, "
+            "nothing to ground); semantically the operator should reject such a draft."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _claims_appear_in_prose(self) -> Self:
+        # Late local import to avoid circularity: extractor imports models.
+        from .extractor import _normalise_for_substring
+
+        prose_norm = _normalise_for_substring(self.prose)
+        for i, claim in enumerate(self.claims):
+            claim_norm = _normalise_for_substring(claim.text)
+            if not claim_norm:
+                raise ValueError(f"claims[{i}].text is empty after whitespace+case normalisation.")
+            if claim_norm not in prose_norm:
+                raise ValueError(
+                    f"claims[{i}].text {claim.text!r} is not a substring of prose "
+                    "(after whitespace+case normalisation); the prose↔claims correspondence "
+                    "is what makes the critic's substring check mechanically possible."
+                )
+        return self
+
+    @property
+    def paragraph_count(self) -> int:
+        """Paragraphs in `prose` — non-empty blocks separated by one+ blank lines.
+
+        Computed from `prose` rather than stored so the projection cannot drift
+        from the actual text. Empty prose would have failed `min_length=1`, so
+        the count is always >= 1 for a validated Draft.
+        """
+        blocks = [b for b in self.prose.split("\n\n") if b.strip()]
+        return len(blocks) or 1
+
+    @property
+    def char_count(self) -> int:
+        """Length of `prose` in characters (no normalisation)."""
+        return len(self.prose)
+
+    @property
+    def claim_count(self) -> int:
+        """Number of enumerable claims in the Draft. Useful for audit projections."""
+        return len(self.claims)

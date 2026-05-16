@@ -85,6 +85,14 @@ Underneath every node: the habitat's audit chain — `workflows` / `workflow_ste
 
 ---
 
+## Walkthrough
+
+**5-minute video demo:** [Watch on Loom](https://www.loom.com/share/6d0e715eae75445092a97d69862c55b0)
+
+See the full crew run end-to-end against Plaid — checkpoint approval, the critic catching an ungrounded claim, the bounded retry, and the audit trail query.
+
+---
+
 ## Quick start
 
 Requires Python 3.13+ and an Anthropic API key.

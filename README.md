@@ -10,6 +10,8 @@ The product is the habitat itself, not any specific workload. The lead-enrichmen
 
 If you've built with CrewAI or vanilla LangGraph tutorials and hit the wall at "fine on the demo, but I can't tell you what the agent actually did" — that's the wall this project is built against.
 
+🎬 [Watch the 5-minute walkthrough →](https://www.loom.com/share/6d0e715eae75445092a97d69862c55b0)
+
 ---
 
 ## What makes it different
@@ -82,14 +84,6 @@ flowchart TD
 Underneath every node: the habitat's audit chain — `workflows` / `workflow_steps` / `events` rows in SQLite ([ADR-002](docs/adr/ADR-002-persistence-schema.md)), one JSONL telemetry line per LLM call via `llm.py`, LangGraph's `SqliteSaver` writing checkpoint blobs to the same `.db` file for cross-session resume.
 
 **Stats:** 5,969 lines of source across `agents/` and `orchestration/`. 538 deterministic tests plus a handful of `@pytest.mark.live` smokes. `ruff check`, `ruff format --check`, `mypy --strict` all clean. Seven accepted ADRs covering every non-trivial decision.
-
----
-
-## Walkthrough
-
-**5-minute video demo:** [Watch on Loom](https://www.loom.com/share/6d0e715eae75445092a97d69862c55b0)
-
-See the full crew run end-to-end against Plaid — checkpoint approval, the critic catching an ungrounded claim, the bounded retry, and the audit trail query.
 
 ---
 
